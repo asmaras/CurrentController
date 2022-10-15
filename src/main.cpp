@@ -6,10 +6,12 @@ int _currentMinimumInmA = 13000;
 int _currentDeadBandInmA = 500;
 int _currentHardLimitInmA = 15000;
 
+int _powerOnDelay = 15;
 constexpr int _currentMeasureFrequency = 1000;
 int _currentIntegralRegulationRangeInmA = 4000;
 int _currentIntegralRegulationFrequencyMax = 30;
-int _currentIntegralRegulationFrequencyMin = 5;
+int _currentIntegralRegulationFrequencyMin = 1;
+constexpr int _safeModeTime = 3;
 
 constexpr int _buttonReadFrequency = 20;
 constexpr int _blinkerFrequency = 200;
@@ -42,27 +44,39 @@ void setup() {
   SPI.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
   // Set combined pin for current sensor and button as input
   pinMode(_currentSensorAndButtonPin, INPUT);
-  // Before enabling current regulation we must set it to the lowest current
-  SetLowestCurrent();
-  // Enable regulation
-  // This pin is externaly pulled up so at power-up regulation is always disabled
-  // From software we can set this pin low to enable regulation
-  // First set value then set pin as output
-  EnableRegulation();
-  pinMode(_enableCurrentRegulationNotPin, OUTPUT);
   // Set combined pin for the two status LEDs to tri-state
   pinMode(_statusLedsPin, INPUT);
+  // Initially set regulation to the lowest current
+  // During the power-on delay regulation is also disabled by hardware
+  // that uses an external pull-up resistor
+  // Regulation can not take place before we set a pin low from software
+  SetLowestCurrent();
   // uint8_t eepromValue = EEPROM.read(0);
   // EEPROM.write(0, eepromValue + 1);
   // TEST testStruct;
   // EEPROM.put(0, testStruct);
   // EEPROM.get(0, testStruct);
+  // SPI.transfer16(0x418F);
 }
 
 void loop() {
   unsigned long currentTime = micros();
 
-  MeasureAndRegulate(currentTime);
+  // Check power-on delay
+  static bool powerOnDelayCompleted = false;
+  if (!powerOnDelayCompleted && (currentTime / 1000000 >= (unsigned)_powerOnDelay)) {
+    powerOnDelayCompleted = true;
+    // Enable regulation
+    // This pin is externaly pulled up so at power-up regulation is always disabled
+    // From software we can set this pin low to enable regulation
+    // First set value then set pin as output
+    EnableRegulation();
+    pinMode(_enableCurrentRegulationNotPin, OUTPUT);
+  }
+
+  if (powerOnDelayCompleted) {
+    MeasureAndRegulate(currentTime);
+  }
   
   HandleButtonInput(currentTime);
 
@@ -141,7 +155,7 @@ bool GetCurrentSensorValueInmA(unsigned long currentTime, int& currentInmA) {
   constexpr uint16_t sensorRangeInmA = 50000;
 
   // See https://en.wikipedia.org/wiki/Oversampling
-  constexpr int numberOfBits = 12; // Rest will be calculated from this
+  constexpr int numberOfBits = 13; // Rest will be calculated from this
   constexpr int numberOfExtraBits = numberOfBits - 10;
   constexpr int numberOfReadings = 1 << (numberOfExtraBits * 2); // 4 ^ numberOfExtraBits
   constexpr int oversampledValueRange = 1 << numberOfBits;
@@ -170,18 +184,20 @@ bool GetCurrentSensorValueInmA(unsigned long currentTime, int& currentInmA) {
 int CalculateCurrentChangeFrequency(int currentInmA, int setpointCurrentInmA) {
   int deviationInmA = abs(setpointCurrentInmA - currentInmA);
   int changeFrequency =
+    (int32_t)_currentIntegralRegulationFrequencyMin +
     (
-      (int32_t)(_currentIntegralRegulationFrequencyMax - _currentIntegralRegulationFrequencyMin) *
-      (int32_t)deviationInmA
-    ) /
-    (int32_t)_currentIntegralRegulationRangeInmA;
+      (
+        (int32_t)(_currentIntegralRegulationFrequencyMax - _currentIntegralRegulationFrequencyMin) *
+        (int32_t)deviationInmA
+        ) /
+      (int32_t)_currentIntegralRegulationRangeInmA
+      );
   if (changeFrequency > _currentIntegralRegulationFrequencyMax) {
-    changeFrequency = _currentIntegralRegulationFrequencyMax;
+    return _currentIntegralRegulationFrequencyMax;
   }
-  else if (changeFrequency < _currentIntegralRegulationFrequencyMin) {
-    changeFrequency = _currentIntegralRegulationFrequencyMin;
+  else {
+    return changeFrequency;
   }
-  return changeFrequency;
 }
 
 enum class CurrentIntegralRegulationAction {
@@ -197,40 +213,59 @@ void MeasureAndRegulate(unsigned long currentTime) {
   static CurrentIntegralRegulationAction currentIntegralRegulationAction = CurrentIntegralRegulationAction::none;
   bool changeCurrentImmediately = false;
   static int changeFrequency = 0;
+  static bool safeMode = false;
+  static unsigned long safeModeStartTime = 0;
+  // Perform sensor measurements at a fixed frequency
   if (IntervalHasPassed(startFirstCurrentMeasureInterval, currentTime, currentMeasureIntervalStartTime, _currentMeasureFrequency)) {
     if (GetCurrentSensorValueInmA(currentTime, currentInmA)) {
-      if (currentInmA < _currentMinimumInmA) {
-        // Current too low, regulate up
-        if (currentIntegralRegulationAction != CurrentIntegralRegulationAction::up) {
-          changeCurrentImmediately = true;
+      if (safeMode) {
+        // In safe mode
+        // Go back to regulation mode when the current stays under the minimum for some time
+        if (
+          currentInmA < _currentMinimumInmA &&
+          currentTime - safeModeStartTime >= _safeModeTime * 1000000
+          ) {
+          safeMode = false;
+          EnableRegulation();
         }
-        currentIntegralRegulationAction = CurrentIntegralRegulationAction::up;
-        changeFrequency = CalculateCurrentChangeFrequency(currentInmA, _currentMinimumInmA);
-      }
-      else if (currentInmA > _currentHardLimitInmA) {
-        // Current dangerously high, go to safe mode
-        // Activate the regulation disable output
-        // As an extra safety also set regulation to lowest possible current
-        currentIntegralRegulationAction = CurrentIntegralRegulationAction::none;
-        DisableRegulation();
-        SetLowestCurrent();
-      }
-      else if (currentInmA > _currentMinimumInmA + _currentDeadBandInmA) {
-        // Current is too high, regulate down
-        if (currentIntegralRegulationAction != CurrentIntegralRegulationAction::down) {
-          changeCurrentImmediately = true;
-        }
-        currentIntegralRegulationAction = CurrentIntegralRegulationAction::down;
-        changeFrequency = CalculateCurrentChangeFrequency(currentInmA, _currentMinimumInmA + _currentDeadBandInmA);
       }
       else {
-        // Current is within dead band, do nothing
-        currentIntegralRegulationAction = CurrentIntegralRegulationAction::none;
+        // In normal regulation mode
+        if (currentInmA < _currentMinimumInmA) {
+          // Current too low, regulate up
+          if (currentIntegralRegulationAction != CurrentIntegralRegulationAction::up) {
+            changeCurrentImmediately = true;
+          }
+          currentIntegralRegulationAction = CurrentIntegralRegulationAction::up;
+          changeFrequency = CalculateCurrentChangeFrequency(currentInmA, _currentMinimumInmA);
+        }
+        else if (currentInmA > _currentHardLimitInmA) {
+          // Current dangerously high, go to safe mode
+          // Activate the regulation disable output
+          // As an extra safety also set regulation to lowest possible current
+          DisableRegulation();
+          SetLowestCurrent();
+          safeMode = true;
+          safeModeStartTime = currentTime;
+        }
+        else if (currentInmA > _currentMinimumInmA + _currentDeadBandInmA) {
+          // Current is too high, regulate down
+          if (currentIntegralRegulationAction != CurrentIntegralRegulationAction::down) {
+            changeCurrentImmediately = true;
+          }
+          currentIntegralRegulationAction = CurrentIntegralRegulationAction::down;
+          changeFrequency = CalculateCurrentChangeFrequency(currentInmA, _currentMinimumInmA + _currentDeadBandInmA);
+        }
+        else {
+          // Current is within dead band, do nothing
+          currentIntegralRegulationAction = CurrentIntegralRegulationAction::none;
+        }
       }
     }
   }
 
-  if (currentIntegralRegulationAction != CurrentIntegralRegulationAction::none) {
+  // Integral regulation actions are done at their own frequency, independent from sensor measurements
+  if (!safeMode && currentIntegralRegulationAction != CurrentIntegralRegulationAction::none) {
     static unsigned long regulateIntervalStartTime = 0;
     if (IntervalHasPassed(changeCurrentImmediately, currentTime, regulateIntervalStartTime, changeFrequency)) {
       switch (currentIntegralRegulationAction) {
