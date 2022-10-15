@@ -2,6 +2,13 @@
 #include <SPI.h>
 // #include <EEPROM.h>
 
+// This is the mA range of the sensor covered by ADC values 0 to max
+// The maximum current rating of the sensor may be less
+constexpr uint16_t _currentSensorRangeInmA = 50000;
+
+// The ADC value that corresponds to zero current
+constexpr int _currentSensorAdcZeroPoint = 512;
+
 int _currentMinimumInmA = 13000;
 int _currentDeadBandInmA = 500;
 int _currentHardLimitInmA = 15000;
@@ -21,17 +28,17 @@ constexpr int _currentSensorAndButtonPinThresholdForButton = 950;
 constexpr int _enableCurrentRegulationNotPin = 3;
 constexpr int _statusLedsPin = 4;
 
-bool IntervalHasPassed(bool& startFirstInterval, unsigned long currentTime, unsigned long& startTime, int frequency);
-void MeasureAndRegulate(unsigned long currentTime);
-void HandleButtonInput(unsigned long currentTime);
+bool IntervalHasPassed(bool& startFirstInterval, unsigned long& startTime, int frequency);
+void MeasureAndRegulate();
+void HandleButtonInput();
 void EnableRegulation();
 void DisableRegulation();
 void SetLowestCurrent();
-void IncrementCurrent(unsigned long currentTime);
+void IncrementCurrent();
 void DecrementCurrent();
 void SetPotentiometers();
-void Blinker(unsigned long currentTime);
-void BlinkerRegulationAction(unsigned long currentTime);
+void Blinker();
+void BlinkerRegulationAction();
 
 struct TEST {
   int test1;
@@ -59,12 +66,14 @@ void setup() {
   // SPI.transfer16(0x418F);
 }
 
+unsigned long _currentTime = 0;
+
 void loop() {
-  unsigned long currentTime = micros();
+  _currentTime = micros();
 
   // Check power-on delay
   static bool powerOnDelayCompleted = false;
-  if (!powerOnDelayCompleted && (currentTime / 1000000 >= (unsigned)_powerOnDelay)) {
+  if (!powerOnDelayCompleted && (_currentTime / 1000000 >= (unsigned)_powerOnDelay)) {
     powerOnDelayCompleted = true;
     // Enable regulation
     // This pin is externaly pulled up so at power-up regulation is always disabled
@@ -75,30 +84,30 @@ void loop() {
   }
 
   if (powerOnDelayCompleted) {
-    MeasureAndRegulate(currentTime);
+    MeasureAndRegulate();
   }
   
-  HandleButtonInput(currentTime);
+  HandleButtonInput();
 
-  Blinker(currentTime);
+  Blinker();
 }
 
-bool IntervalHasPassed(bool& startFirstInterval, unsigned long currentTime, unsigned long& startTime, int frequency) {
+bool IntervalHasPassed(bool& startFirstInterval, unsigned long& startTime, int frequency) {
   if (startFirstInterval) {
-    startTime = currentTime;
+    startTime = _currentTime;
     startFirstInterval = false;
     return true;
   }
   else {
     unsigned long interval = 1000000 / frequency;
 
-    if (currentTime - startTime >= interval) {
+    if (_currentTime - startTime >= interval) {
       // If we are within the next interval, compensate for clock skew by adding exactly one interval time
-      if (currentTime - startTime < interval * 2) {
+      if (_currentTime - startTime < interval * 2) {
         startTime += interval;
       }
       else {
-        startTime = currentTime;
+        startTime = _currentTime;
       }
       return true;
     }
@@ -119,9 +128,9 @@ void CurrentSensorNewOversamplingCycle() {
 bool _currentSensorReadingSuspended = false;
 unsigned long _currentSensorReadingSuspendedStartTime = 0;
 
-void SuspendCurrentSensorReading(unsigned long currentTime) {
+void SuspendCurrentSensorReading() {
   _currentSensorReadingSuspended = true;
-  _currentSensorReadingSuspendedStartTime = currentTime;
+  _currentSensorReadingSuspendedStartTime = _currentTime;
 }
 
 void ResumeCurrentSensorReading() {
@@ -129,9 +138,9 @@ void ResumeCurrentSensorReading() {
   CurrentSensorNewOversamplingCycle();
 }
 
-bool GetCurrentSensorAnalogValue(unsigned long currentTime, int& value) {
+bool GetCurrentSensorAnalogValue(int& value) {
   if (_currentSensorReadingSuspended) {
-    if (currentTime - _currentSensorReadingSuspendedStartTime >= 100 * 1000UL) {
+    if (_currentTime - _currentSensorReadingSuspendedStartTime >= 100 * 1000UL) {
       ResumeCurrentSensorReading();
     }
     else {
@@ -144,33 +153,29 @@ bool GetCurrentSensorAnalogValue(unsigned long currentTime, int& value) {
     return true;
   }
   else {
-    SuspendCurrentSensorReading(currentTime);
+    SuspendCurrentSensorReading();
     return false;
   }
 }
 
-bool GetCurrentSensorValueInmA(unsigned long currentTime, int& currentInmA) {
-  // This is the mA range of the sensor covered by ADC values 0 to max
-  // The maximum current rating of the sensor may be less
-  constexpr uint16_t sensorRangeInmA = 50000;
-
+bool GetCurrentSensorValueInmA(int& currentInmA) {
   // See https://en.wikipedia.org/wiki/Oversampling
   constexpr int numberOfBits = 13; // Rest will be calculated from this
   constexpr int numberOfExtraBits = numberOfBits - 10;
   constexpr int numberOfReadings = 1 << (numberOfExtraBits * 2); // 4 ^ numberOfExtraBits
   constexpr int oversampledValueRange = 1 << numberOfBits;
-  constexpr int halfwayPoint = oversampledValueRange >> 1;
+  constexpr int zeroPoint = _currentSensorAdcZeroPoint << numberOfExtraBits;
 
   // Add 10-bit reading
   int reading10Bit;
-  if(GetCurrentSensorAnalogValue(currentTime, reading10Bit)) {
-    _currentSensorReadingOversampledValue += analogRead(_currentSensorAndButtonPin);
+  if(GetCurrentSensorAnalogValue(reading10Bit)) {
+    _currentSensorReadingOversampledValue += reading10Bit;
     _currentSensorReadingCounter++;
     if (_currentSensorReadingCounter == numberOfReadings) {
       // Decimate accumulated readings
       _currentSensorReadingOversampledValue >>= numberOfExtraBits;
 
-      currentInmA = ((_currentSensorReadingOversampledValue - (uint32_t)halfwayPoint) * (uint32_t)sensorRangeInmA) / (uint32_t)oversampledValueRange;
+      currentInmA = ((_currentSensorReadingOversampledValue - (uint32_t)zeroPoint) * (uint32_t)_currentSensorRangeInmA) / (uint32_t)oversampledValueRange;
 
       // Prepare for next oversampling cycle
       CurrentSensorNewOversamplingCycle();
@@ -200,32 +205,42 @@ int CalculateCurrentChangeFrequency(int currentInmA, int setpointCurrentInmA) {
   }
 }
 
+bool _safeMode = false;
+unsigned long _safeModeStartTime = 0;
+
+void GoToSafeMode() {
+  // Activate the regulation disable output
+  // As an extra safety also set regulation to lowest possible current
+  DisableRegulation();
+  SetLowestCurrent();
+  _safeMode = true;
+  _safeModeStartTime = _currentTime;
+}
+
 enum class CurrentIntegralRegulationAction {
   none,
   up,
   down
 };
 
-void MeasureAndRegulate(unsigned long currentTime) {
+void MeasureAndRegulate() {
   static bool startFirstCurrentMeasureInterval = true;
   static unsigned long currentMeasureIntervalStartTime = 0;
   int currentInmA = 0;
   static CurrentIntegralRegulationAction currentIntegralRegulationAction = CurrentIntegralRegulationAction::none;
   bool changeCurrentImmediately = false;
   static int changeFrequency = 0;
-  static bool safeMode = false;
-  static unsigned long safeModeStartTime = 0;
   // Perform sensor measurements at a fixed frequency
-  if (IntervalHasPassed(startFirstCurrentMeasureInterval, currentTime, currentMeasureIntervalStartTime, _currentMeasureFrequency)) {
-    if (GetCurrentSensorValueInmA(currentTime, currentInmA)) {
-      if (safeMode) {
+  if (IntervalHasPassed(startFirstCurrentMeasureInterval, currentMeasureIntervalStartTime, _currentMeasureFrequency)) {
+    if (GetCurrentSensorValueInmA(currentInmA)) {
+      if (_safeMode) {
         // In safe mode
         // Go back to regulation mode when the current stays under the minimum for some time
         if (
           currentInmA < _currentMinimumInmA &&
-          currentTime - safeModeStartTime >= _safeModeTime * 1000000
+          _currentTime - _safeModeStartTime >= _safeModeTime * 1000000
           ) {
-          safeMode = false;
+          _safeMode = false;
           EnableRegulation();
         }
       }
@@ -241,12 +256,7 @@ void MeasureAndRegulate(unsigned long currentTime) {
         }
         else if (currentInmA > _currentHardLimitInmA) {
           // Current dangerously high, go to safe mode
-          // Activate the regulation disable output
-          // As an extra safety also set regulation to lowest possible current
-          DisableRegulation();
-          SetLowestCurrent();
-          safeMode = true;
-          safeModeStartTime = currentTime;
+          GoToSafeMode();
         }
         else if (currentInmA > _currentMinimumInmA + _currentDeadBandInmA) {
           // Current is too high, regulate down
@@ -265,12 +275,12 @@ void MeasureAndRegulate(unsigned long currentTime) {
   }
 
   // Integral regulation actions are done at their own frequency, independent from sensor measurements
-  if (!safeMode && currentIntegralRegulationAction != CurrentIntegralRegulationAction::none) {
+  if (!_safeMode && currentIntegralRegulationAction != CurrentIntegralRegulationAction::none) {
     static unsigned long regulateIntervalStartTime = 0;
-    if (IntervalHasPassed(changeCurrentImmediately, currentTime, regulateIntervalStartTime, changeFrequency)) {
+    if (IntervalHasPassed(changeCurrentImmediately, regulateIntervalStartTime, changeFrequency)) {
       switch (currentIntegralRegulationAction) {
       case CurrentIntegralRegulationAction::up:
-        IncrementCurrent(currentTime);
+        IncrementCurrent();
         break;
       case CurrentIntegralRegulationAction::down:
         DecrementCurrent();
@@ -290,31 +300,38 @@ void DisableRegulation() {
   digitalWrite(_enableCurrentRegulationNotPin, 1);
 }
 
-uint16_t aggregatePotentiometerValue = 0;
+uint16_t _aggregatePotentiometerValue = 0;
 
 void SetLowestCurrent() {
-  aggregatePotentiometerValue = 0;
+  _aggregatePotentiometerValue = 0;
   SetPotentiometers();
 }
 
-void IncrementCurrent(unsigned long currentTime) {
-  if (aggregatePotentiometerValue < 512) {
-    aggregatePotentiometerValue++;
+void IncrementCurrent() {
+  if (_aggregatePotentiometerValue < 512) {
+    _aggregatePotentiometerValue++;
     SetPotentiometers();
   }
-  BlinkerRegulationAction(currentTime);
+  BlinkerRegulationAction();
 }
 
 void DecrementCurrent() {
-  if (aggregatePotentiometerValue > 0) {
-    aggregatePotentiometerValue--;
+  if (_aggregatePotentiometerValue > 0) {
+    _aggregatePotentiometerValue--;
     SetPotentiometers();
   }
 }
 
 void SetPotentiometers() {
-  SPI.transfer16((aggregatePotentiometerValue + 1) / 2);
-  SPI.transfer16((aggregatePotentiometerValue / 2) | 0x1000);
+  // MCP4251 is used, see https://ww1.microchip.com/downloads/aemDocuments/documents/OTH/ProductDocuments/DataSheets/22060b.pdf
+  SPI.transfer16((_aggregatePotentiometerValue + 1) / 2);
+  SPI.transfer16((_aggregatePotentiometerValue / 2) | 0x1000);
+
+  // Check value of wiper 0
+  // Expected a 7 bits set to "1" followed by the value
+  if (SPI.transfer16(0x0C00) != (0xFE00 | (_aggregatePotentiometerValue + 1) / 2)) {
+    GoToSafeMode();
+  }
 }
 
 enum class ButtonEvent {
@@ -323,14 +340,14 @@ enum class ButtonEvent {
   longPress
 };
 
-void HandleButtonInput(unsigned long currentTime) {
+void HandleButtonInput() {
   static bool buttonDepressed = false;
   ButtonEvent buttonEvent = ButtonEvent::none;
   static bool startFirstButtonReadInterval = true;
   static unsigned long buttonReadIntervalStartTime = 0;
-  if (IntervalHasPassed(startFirstButtonReadInterval, currentTime, buttonReadIntervalStartTime, _buttonReadFrequency)) {
+  if (IntervalHasPassed(startFirstButtonReadInterval, buttonReadIntervalStartTime, _buttonReadFrequency)) {
     if (analogRead(_currentSensorAndButtonPin) >= _currentSensorAndButtonPinThresholdForButton) {
-      SuspendCurrentSensorReading(currentTime);
+      SuspendCurrentSensorReading();
       if (!buttonDepressed) {
         buttonDepressed = true;
         buttonEvent = ButtonEvent::shortPress;
@@ -376,13 +393,13 @@ struct LedIndicatorInfo {
 LedIndicatorInfo _led1IndicatorInfo;
 LedIndicatorInfo _led2IndicatorInfo;
 
-void Blinker(unsigned long currentTime) {
+void Blinker() {
   bool led2On = false;
   switch (_led2IndicatorInfo.mode) {
   case LedIndicatorMode::none:
     break;
   case LedIndicatorMode::pulseOnce:
-    if (currentTime - _led2IndicatorInfo.pulseOnceStartTime >= 11 * 1000UL) {
+    if (_currentTime - _led2IndicatorInfo.pulseOnceStartTime >= 11 * 1000UL) {
       _led2IndicatorInfo.mode = LedIndicatorMode::none;
     }
     else {
@@ -399,7 +416,7 @@ void Blinker(unsigned long currentTime) {
 
   static bool startFirstAliveInterval = true;
   static unsigned long aliveIntervalStartTime = 0;
-  if (IntervalHasPassed(startFirstAliveInterval, currentTime, aliveIntervalStartTime, 3)) {
+  if (IntervalHasPassed(startFirstAliveInterval, aliveIntervalStartTime, 3)) {
     led1On = !led1On;
   }
 
@@ -407,7 +424,7 @@ void Blinker(unsigned long currentTime) {
   static bool startFirstMultiplexInterval = true;
   static unsigned long multiplexIntervalStartTime = 0;
   static uint8_t multiplexSelector = 0;
-  if (IntervalHasPassed(startFirstMultiplexInterval, currentTime, multiplexIntervalStartTime, _blinkerFrequency)) {
+  if (IntervalHasPassed(startFirstMultiplexInterval, multiplexIntervalStartTime, _blinkerFrequency)) {
     if (multiplexSelector % 2 == 0) {
       if (led1On) {
         digitalWrite(_statusLedsPin, 1);
@@ -430,7 +447,7 @@ void Blinker(unsigned long currentTime) {
   }
 }
 
-void BlinkerRegulationAction(unsigned long currentTime) {
+void BlinkerRegulationAction() {
   _led2IndicatorInfo.mode = LedIndicatorMode::pulseOnce;
-  _led2IndicatorInfo.pulseOnceStartTime = currentTime;
+  _led2IndicatorInfo.pulseOnceStartTime = _currentTime;
 }
