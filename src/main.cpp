@@ -9,13 +9,13 @@ constexpr uint16_t _currentSensorRangeInmA = 50000;
 // The ADC value that corresponds to zero current
 constexpr int _currentSensorAdcZeroPoint = 512;
 
-int _currentMinimumInmA = 13000;
+int _currentMinimumInmA = 4000;
 int _currentDeadBandInmA = 500;
-int _currentHardLimitInmA = 15000;
+int _currentHardLimitInmA = 8000;
 
 int _powerOnDelay = 15;
 constexpr int _currentMeasureFrequency = 1000;
-int _currentIntegralRegulationRangeInmA = 4000;
+int _currentIntegralRegulationCoefficient = 7;
 int _currentIntegralRegulationFrequencyMax = 30;
 int _currentIntegralRegulationFrequencyMin = 1;
 constexpr int _safeModeTime = 3;
@@ -126,11 +126,11 @@ void CurrentSensorNewOversamplingCycle() {
 }
 
 bool _currentSensorReadingSuspended = false;
-unsigned long _currentSensorReadingSuspendedStartTime = 0;
+int _currentSensorReadingSuspendedCountdown = 0;
 
 void SuspendCurrentSensorReading() {
   _currentSensorReadingSuspended = true;
-  _currentSensorReadingSuspendedStartTime = _currentTime;
+  _currentSensorReadingSuspendedCountdown = 2;
 }
 
 void ResumeCurrentSensorReading() {
@@ -140,21 +140,18 @@ void ResumeCurrentSensorReading() {
 
 bool GetCurrentSensorAnalogValue(int& value) {
   if (_currentSensorReadingSuspended) {
-    if (_currentTime - _currentSensorReadingSuspendedStartTime >= 100 * 1000UL) {
-      ResumeCurrentSensorReading();
-    }
-    else {
       return false;
-    }
-  }
-
-  value = analogRead(_currentSensorAndButtonPin);
-  if (value < _currentSensorAndButtonPinThresholdForButton) {
-    return true;
   }
   else {
-    SuspendCurrentSensorReading();
-    return false;
+    value = analogRead(_currentSensorAndButtonPin);
+    if (value < _currentSensorAndButtonPinThresholdForButton) {
+      return true;
+    }
+    else {
+      // Because the pin is shared suspend sensor reading during button presses
+      SuspendCurrentSensorReading();
+      return false;
+    }
   }
 }
 
@@ -192,10 +189,9 @@ int CalculateCurrentChangeFrequency(int currentInmA, int setpointCurrentInmA) {
     (int32_t)_currentIntegralRegulationFrequencyMin +
     (
       (
-        (int32_t)(_currentIntegralRegulationFrequencyMax - _currentIntegralRegulationFrequencyMin) *
-        (int32_t)deviationInmA
+        (int32_t)deviationInmA * (int32_t)_currentIntegralRegulationCoefficient
         ) /
-      (int32_t)_currentIntegralRegulationRangeInmA
+      1000UL
       );
   if (changeFrequency > _currentIntegralRegulationFrequencyMax) {
     return _currentIntegralRegulationFrequencyMax;
@@ -325,10 +321,10 @@ void DecrementCurrent() {
 void SetPotentiometers() {
   // MCP4251 is used, see https://ww1.microchip.com/downloads/aemDocuments/documents/OTH/ProductDocuments/DataSheets/22060b.pdf
   SPI.transfer16((_aggregatePotentiometerValue + 1) / 2);
-  SPI.transfer16((_aggregatePotentiometerValue / 2) | 0x1000);
+  SPI.transfer16(0x1000 | (_aggregatePotentiometerValue / 2));
 
   // Check value of wiper 0
-  // Expected a 7 bits set to "1" followed by the value
+  // Expected are 7 bits set to "1" followed by the value
   if (SPI.transfer16(0x0C00) != (0xFE00 | (_aggregatePotentiometerValue + 1) / 2)) {
     GoToSafeMode();
   }
@@ -347,13 +343,22 @@ void HandleButtonInput() {
   static unsigned long buttonReadIntervalStartTime = 0;
   if (IntervalHasPassed(startFirstButtonReadInterval, buttonReadIntervalStartTime, _buttonReadFrequency)) {
     if (analogRead(_currentSensorAndButtonPin) >= _currentSensorAndButtonPinThresholdForButton) {
+      // Because the pin is shared suspend sensor reading during button presses
       SuspendCurrentSensorReading();
+
       if (!buttonDepressed) {
         buttonDepressed = true;
         buttonEvent = ButtonEvent::shortPress;
       }
     }
     else {
+      // If sensor reading is suspended it may be resumed after button release has been detected a few times
+      if (_currentSensorReadingSuspended) {
+        if (--_currentSensorReadingSuspendedCountdown == 0) {
+          ResumeCurrentSensorReading();
+        }
+      }
+
       buttonDepressed = false;
     }
   }
