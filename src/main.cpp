@@ -9,13 +9,22 @@ constexpr uint16_t _currentSensorRangeInmA = 50000;
 // The ADC value that corresponds to zero current
 constexpr int _currentSensorAdcZeroPoint = 512;
 
-int _currentMinimumInmA = 4000;
-int _currentDeadBandInmA = 500;
-int _currentHardLimitInmA = 8000;
+// Initial current values
+constexpr int _initialCurrentMinimumInmA = 4000;
+constexpr int _initialCurrentDeadBandInmA = 500;
+constexpr int _initialCurrentHardLimitInmA = 8000;
 
-int _powerOnDelay = 15;
+// Initial regulation parameters
+constexpr int _initialPowerOnDelay = 15;
+constexpr int _initialCurrentIntegralRegulationCoefficient = 7;
+
+int _currentMinimumInmA = 14000;
+int _currentDeadBandInmA = 500;
+int _currentHardLimitInmA = 15000;
+
+int _powerOnDelay = _initialPowerOnDelay;
 constexpr int _currentMeasureFrequency = 1000;
-int _currentIntegralRegulationCoefficient = 7;
+int _currentIntegralRegulationCoefficient = _initialCurrentIntegralRegulationCoefficient;
 int _currentIntegralRegulationFrequencyMax = 30;
 int _currentIntegralRegulationFrequencyMin = 1;
 constexpr int _safeModeTime = 3;
@@ -38,12 +47,23 @@ void IncrementCurrent();
 void DecrementCurrent();
 void SetPotentiometers();
 void Blinker();
-void BlinkerRegulationAction();
+
+enum class LedIndicatorLedNumber
+{
+  Led1 = 0,
+  Led2 = 1
+};
+
+void LedIndicatorAlive();
+void LedIndicatorRegulationAction();
+void LedIndicatorShowDecimal(LedIndicatorLedNumber ledNumber, int decimal);
 
 struct TEST {
   int test1;
   float test2;
 };
+
+bool _debugMode = false;
 
 void setup() {
   // Initialize SPI
@@ -58,23 +78,25 @@ void setup() {
   // that uses an external pull-up resistor
   // Regulation can not take place before we set a pin low from software
   SetLowestCurrent();
+  LedIndicatorAlive();
   // uint8_t eepromValue = EEPROM.read(0);
   // EEPROM.write(0, eepromValue + 1);
   // TEST testStruct;
   // EEPROM.put(0, testStruct);
   // EEPROM.get(0, testStruct);
   // SPI.transfer16(0x418F);
+  LedIndicatorShowDecimal(LedIndicatorLedNumber::Led1, 375);
 }
 
 unsigned long _currentTime = 0;
+bool _powerOnDelayCompleted = false;
 
 void loop() {
   _currentTime = micros();
 
   // Check power-on delay
-  static bool powerOnDelayCompleted = false;
-  if (!powerOnDelayCompleted && (_currentTime / 1000000 >= (unsigned)_powerOnDelay)) {
-    powerOnDelayCompleted = true;
+  if (!_powerOnDelayCompleted && (_currentTime / 1000000 >= (unsigned)_powerOnDelay)) {
+    _powerOnDelayCompleted = true;
     // Enable regulation
     // This pin is externaly pulled up so at power-up regulation is always disabled
     // From software we can set this pin low to enable regulation
@@ -83,7 +105,7 @@ void loop() {
     pinMode(_enableCurrentRegulationNotPin, OUTPUT);
   }
 
-  if (powerOnDelayCompleted) {
+  if (_powerOnDelayCompleted) {
     MeasureAndRegulate();
   }
   
@@ -100,7 +122,6 @@ bool IntervalHasPassed(bool& startFirstInterval, unsigned long& startTime, int f
   }
   else {
     unsigned long interval = 1000000 / frequency;
-
     if (_currentTime - startTime >= interval) {
       // If we are within the next interval, compensate for clock skew by adding exactly one interval time
       if (_currentTime - startTime < interval * 2) {
@@ -133,9 +154,13 @@ void SuspendCurrentSensorReading() {
   _currentSensorReadingSuspendedCountdown = 2;
 }
 
-void ResumeCurrentSensorReading() {
-  _currentSensorReadingSuspended = false;
-  CurrentSensorNewOversamplingCycle();
+void ResumeCurrentSensorReadingEvent() {
+  if (_currentSensorReadingSuspended) {
+    if (--_currentSensorReadingSuspendedCountdown == 0) {
+      _currentSensorReadingSuspended = false;
+      CurrentSensorNewOversamplingCycle();
+    }
+  }
 }
 
 bool GetCurrentSensorAnalogValue(int& value) {
@@ -188,10 +213,7 @@ int CalculateCurrentChangeFrequency(int currentInmA, int setpointCurrentInmA) {
   int changeFrequency =
     (int32_t)_currentIntegralRegulationFrequencyMin +
     (
-      (
-        (int32_t)deviationInmA * (int32_t)_currentIntegralRegulationCoefficient
-        ) /
-      1000UL
+      ((int32_t)deviationInmA * (int32_t)_currentIntegralRegulationCoefficient) / 1000UL
       );
   if (changeFrequency > _currentIntegralRegulationFrequencyMax) {
     return _currentIntegralRegulationFrequencyMax;
@@ -205,12 +227,16 @@ bool _safeMode = false;
 unsigned long _safeModeStartTime = 0;
 
 void GoToSafeMode() {
-  // Activate the regulation disable output
-  // As an extra safety also set regulation to lowest possible current
-  DisableRegulation();
-  SetLowestCurrent();
-  _safeMode = true;
-  _safeModeStartTime = _currentTime;
+  if (!_safeMode) {
+    // Set _safeMode first so that any function called below can call GoToSafeMode again without causing a loop
+    _safeMode = true;
+    _safeModeStartTime = _currentTime;
+
+    // Activate the regulation disable output
+    // As an extra safety also set regulation to lowest possible current
+    DisableRegulation();
+    SetLowestCurrent();
+  }
 }
 
 enum class CurrentIntegralRegulationAction {
@@ -234,7 +260,7 @@ void MeasureAndRegulate() {
         // Go back to regulation mode when the current stays under the minimum for some time
         if (
           currentInmA < _currentMinimumInmA &&
-          _currentTime - _safeModeStartTime >= _safeModeTime * 1000000
+          (_currentTime - _safeModeStartTime >= _safeModeTime * 1000000UL)
           ) {
           _safeMode = false;
           EnableRegulation();
@@ -267,6 +293,8 @@ void MeasureAndRegulate() {
           currentIntegralRegulationAction = CurrentIntegralRegulationAction::none;
         }
       }
+
+      LedIndicatorShowDecimal(LedIndicatorLedNumber::Led1, currentInmA / 100);
     }
   }
 
@@ -308,7 +336,7 @@ void IncrementCurrent() {
     _aggregatePotentiometerValue++;
     SetPotentiometers();
   }
-  BlinkerRegulationAction();
+  LedIndicatorRegulationAction();
 }
 
 void DecrementCurrent() {
@@ -323,10 +351,12 @@ void SetPotentiometers() {
   SPI.transfer16((_aggregatePotentiometerValue + 1) / 2);
   SPI.transfer16(0x1000 | (_aggregatePotentiometerValue / 2));
 
-  // Check value of wiper 0
-  // Expected are 7 bits set to "1" followed by the value
-  if (SPI.transfer16(0x0C00) != (0xFE00 | (_aggregatePotentiometerValue + 1) / 2)) {
-    GoToSafeMode();
+  if (!_debugMode) {
+    // Check value of wiper 0
+    // Expected are 7 bits set to "1" followed by the value
+    if (SPI.transfer16(0x0C00) != (0xFE00 | ((_aggregatePotentiometerValue + 1) / 2))) {
+      GoToSafeMode();
+    }
   }
 }
 
@@ -353,11 +383,7 @@ void HandleButtonInput() {
     }
     else {
       // If sensor reading is suspended it may be resumed after button release has been detected a few times
-      if (_currentSensorReadingSuspended) {
-        if (--_currentSensorReadingSuspendedCountdown == 0) {
-          ResumeCurrentSensorReading();
-        }
-      }
+      ResumeCurrentSensorReadingEvent();
 
       buttonDepressed = false;
     }
@@ -367,7 +393,12 @@ void HandleButtonInput() {
   case ButtonEvent::none:
     break;
   case ButtonEvent::shortPress:
-    _currentMinimumInmA += 100;
+    if (_powerOnDelayCompleted) {
+      _currentMinimumInmA += 100;
+    }
+    else {
+      _debugMode = true;
+    }
     break;
   case ButtonEvent::longPress:
     break;
@@ -376,54 +407,118 @@ void HandleButtonInput() {
 
 enum class LedIndicatorMode {
   none,
-  pulseOnce,
-  pulseMultipleTimes,
+  Alive,
   showDecimal
 };
-enum class LedIndicatorShowDecimalState {
-  showHundreds,
-  showTens,
-  showOnes
+struct CadenceElement {
+  uint8_t numberOfPulses;
+  uint16_t onDuration;
+  uint16_t offDuration;
+  uint16_t endDuration;
 };
 struct LedIndicatorInfo {
-  LedIndicatorMode mode = LedIndicatorMode::none;
-  unsigned long pulseOnceStartTime;
-  uint8_t pulseMultipleTimesCounter;
-  LedIndicatorShowDecimalState showDecimalState;
+  bool ledOn;
+  LedIndicatorMode mode;
+  unsigned long eventStartTime;
+  uint16_t eventDuration;
+  CadenceElement cadence[5];
+  uint8_t cadenceLength;
+  uint8_t cadenceIndex;
+  uint8_t cadencePulseCounter;
+  bool interruptCadenceRunning;
   int showDecimalNumber;
-  uint8_t showDecimalHundredsCounter;
-  uint8_t showDecimalTensCounter;
-  uint8_t showDecimalOnesCounter;
 };
-LedIndicatorInfo _led1IndicatorInfo;
-LedIndicatorInfo _led2IndicatorInfo;
+LedIndicatorInfo _ledIndicatorInfo[2] = {};
 
-void Blinker() {
-  bool led2On = false;
-  switch (_led2IndicatorInfo.mode) {
-  case LedIndicatorMode::none:
-    break;
-  case LedIndicatorMode::pulseOnce:
-    if (_currentTime - _led2IndicatorInfo.pulseOnceStartTime >= 11 * 1000UL) {
-      _led2IndicatorInfo.mode = LedIndicatorMode::none;
+void LedIndicatorShowNewDecimal(LedIndicatorInfo& ledIndicatorInfo) {
+  if (ledIndicatorInfo.showDecimalNumber == 0) {
+    ledIndicatorInfo.ledOn = false;
+    ledIndicatorInfo.mode = LedIndicatorMode::none;
+    return;
+  }
+
+  // Hundreds
+  uint8_t numberOfPulses = ledIndicatorInfo.showDecimalNumber / 100;
+  if (numberOfPulses > 0) {
+    ledIndicatorInfo.cadence[0].numberOfPulses = numberOfPulses;
+    ledIndicatorInfo.cadence[0].onDuration = 400;
+    ledIndicatorInfo.cadence[0].offDuration = 200;
+    ledIndicatorInfo.cadence[0].endDuration = 700;
+    ledIndicatorInfo.cadenceLength = 1;
+  }
+  else {
+    ledIndicatorInfo.cadenceLength = 0;
+  }
+  // Tens
+  numberOfPulses = (ledIndicatorInfo.showDecimalNumber % 100) / 10;
+  if (numberOfPulses > 0) {
+    ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceLength].numberOfPulses = numberOfPulses;
+    ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceLength].onDuration = 200;
+    ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceLength].offDuration = 250;
+    ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceLength].endDuration = 700;
+    ledIndicatorInfo.cadenceLength++;
+  }
+  // Ones
+  numberOfPulses = ledIndicatorInfo.showDecimalNumber % 10;
+  if (numberOfPulses > 0) {
+    ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceLength].numberOfPulses = numberOfPulses;
+    ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceLength].onDuration = 100;
+    ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceLength].offDuration = 300;
+    ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceLength].endDuration = 1000;
+    ledIndicatorInfo.cadenceLength++;
+  }
+}
+
+void RunLedIndicator(LedIndicatorInfo& ledIndicatorInfo) {
+  if (
+    ledIndicatorInfo.mode != LedIndicatorMode::none &&
+    (_currentTime - ledIndicatorInfo.eventStartTime >= (unsigned long)ledIndicatorInfo.eventDuration * 1000UL)
+    ) {
+    ledIndicatorInfo.eventStartTime = _currentTime;
+
+    if (ledIndicatorInfo.ledOn) {
+      // LED is on, turn it off for the off-duration or end-duration
+      ledIndicatorInfo.ledOn = false;
+      if (
+        ledIndicatorInfo.cadencePulseCounter == ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceIndex].numberOfPulses &&
+        ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceIndex].endDuration > 0
+        ) {
+        ledIndicatorInfo.eventDuration = ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceIndex].endDuration;
+      }
+      else {
+        ledIndicatorInfo.eventDuration = ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceIndex].offDuration;
+      }
     }
     else {
-      led2On = true;
-    }
-    break;
-  case LedIndicatorMode::pulseMultipleTimes:
-    break;
-  case LedIndicatorMode::showDecimal:
-    break;
-  };
-  
-  static bool led1On = false;
+      // LED is off, a period has been completed
+      // Check if we are at the end of this part of the cadence
+      if (ledIndicatorInfo.cadencePulseCounter == ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceIndex].numberOfPulses) {
+        // Go to the next part of the cadence
+        ledIndicatorInfo.cadenceIndex = (ledIndicatorInfo.cadenceIndex + 1) % ledIndicatorInfo.cadenceLength;
+        if (ledIndicatorInfo.cadenceIndex == 0) {
+          // We're at the start of the cadence sequence again
+          if (ledIndicatorInfo.interruptCadenceRunning) {
+            ledIndicatorInfo.interruptCadenceRunning = false;
+          }
+          if (ledIndicatorInfo.mode == LedIndicatorMode::showDecimal) {
+            // Update the decimal to be shown
+            LedIndicatorShowNewDecimal(ledIndicatorInfo);
+          }
+        }
+        ledIndicatorInfo.cadencePulseCounter = 0;
+      }
 
-  static bool startFirstAliveInterval = true;
-  static unsigned long aliveIntervalStartTime = 0;
-  if (IntervalHasPassed(startFirstAliveInterval, aliveIntervalStartTime, 3)) {
-    led1On = !led1On;
+      // Turn on the LED for the on-duration
+      ledIndicatorInfo.ledOn = true;
+      ledIndicatorInfo.eventDuration = ledIndicatorInfo.cadence[ledIndicatorInfo.cadenceIndex].onDuration;
+      ledIndicatorInfo.cadencePulseCounter++;
+    }
   }
+}
+
+void Blinker() {
+  RunLedIndicator(_ledIndicatorInfo[0]);
+  RunLedIndicator(_ledIndicatorInfo[1]);
 
   // Multiplex the LEDs on one output
   static bool startFirstMultiplexInterval = true;
@@ -431,7 +526,7 @@ void Blinker() {
   static uint8_t multiplexSelector = 0;
   if (IntervalHasPassed(startFirstMultiplexInterval, multiplexIntervalStartTime, _blinkerFrequency)) {
     if (multiplexSelector % 2 == 0) {
-      if (led1On) {
+      if (_ledIndicatorInfo[0].ledOn) {
         digitalWrite(_statusLedsPin, 1);
         pinMode(_statusLedsPin, OUTPUT);
       }
@@ -440,7 +535,7 @@ void Blinker() {
       }
     }
     else {
-      if (led2On) {
+      if (_ledIndicatorInfo[1].ledOn) {
         digitalWrite(_statusLedsPin, 0);
         pinMode(_statusLedsPin, OUTPUT);
       }
@@ -452,7 +547,55 @@ void Blinker() {
   }
 }
 
-void BlinkerRegulationAction() {
-  _led2IndicatorInfo.mode = LedIndicatorMode::pulseOnce;
-  _led2IndicatorInfo.pulseOnceStartTime = _currentTime;
+void LedIndicatorStartCadence(LedIndicatorInfo& ledIndicatorInfo) {
+  ledIndicatorInfo.ledOn = true;
+  ledIndicatorInfo.eventStartTime = _currentTime;
+  ledIndicatorInfo.eventDuration = ledIndicatorInfo.cadence[0].onDuration;
+  ledIndicatorInfo.cadenceIndex = 0;
+  ledIndicatorInfo.cadencePulseCounter = 1;
+}
+
+void LedIndicatorAlive() {
+  _ledIndicatorInfo[1].mode = LedIndicatorMode::Alive;
+  _ledIndicatorInfo[1].cadence[0].numberOfPulses = 1;
+  _ledIndicatorInfo[1].cadence[0].onDuration = 200;
+  _ledIndicatorInfo[1].cadence[0].offDuration = 600;
+  _ledIndicatorInfo[1].cadence[0].endDuration = 0;
+  _ledIndicatorInfo[1].cadenceLength = 1;
+  LedIndicatorStartCadence(_ledIndicatorInfo[1]);
+}
+
+void LedIndicatorRegulationAction() {
+  _ledIndicatorInfo[0].cadence[0].numberOfPulses = 1;
+  _ledIndicatorInfo[0].cadence[0].onDuration = 11;
+  _ledIndicatorInfo[0].cadence[0].offDuration = 2000;
+  _ledIndicatorInfo[0].cadence[0].endDuration = 0;
+  _ledIndicatorInfo[0].cadenceLength = 1;
+  // We interrupt the current indication on LED 1 to show regulation action
+  // It will be restarted after the interrupt
+  _ledIndicatorInfo[0].interruptCadenceRunning = true;
+  LedIndicatorStartCadence(_ledIndicatorInfo[0]);
+}
+
+void LedIndicatorShowDecimal(LedIndicatorLedNumber ledNumber, int decimal) {
+  int led = 0;
+  switch (ledNumber) {
+  case LedIndicatorLedNumber::Led1:
+    led = 0;
+    break;
+  case LedIndicatorLedNumber::Led2:
+    led = 1;
+    break;
+  }
+  _ledIndicatorInfo[led].showDecimalNumber = decimal;
+  // Immediately show the decimal if:
+  // - mode was not yet showDecimal
+  // - the decimal currently being shown is zero
+  if (_ledIndicatorInfo[led].mode != LedIndicatorMode::showDecimal || _ledIndicatorInfo[led].showDecimalNumber == 0) {
+    _ledIndicatorInfo[led].mode = LedIndicatorMode::showDecimal;
+    if (!_ledIndicatorInfo[led].interruptCadenceRunning) {
+      LedIndicatorShowNewDecimal(_ledIndicatorInfo[led]);
+      LedIndicatorStartCadence(_ledIndicatorInfo[led]);
+    }
+  }
 }
