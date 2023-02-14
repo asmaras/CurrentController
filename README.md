@@ -8,6 +8,9 @@ This effectively accumulates the deviations over time\
 The deviation is multiplied by a gain factor (in Hz/A) to get a
 useful value to control the output change frequency
 
+## Hardware
+The hardware schematic can be found [here](https://oshwlab.com/absolute-maximum-ratings/currentcontroller)
+
 \
 \
 Going Dutch now...
