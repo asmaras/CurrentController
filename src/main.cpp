@@ -16,9 +16,9 @@ namespace Constants {
       // Initial regulation parameters
       // These can be overriden by values configured in the settings menu
       constexpr int powerOnDelay = 15;
-      constexpr int minimumCurrentInmA = 14000;//4000;
+      constexpr int minimumCurrentInmA = 4000;
       constexpr int currentDeadBandInmA = 500;
-      constexpr int currentHardLimitInmA = 15000;//8000;
+      constexpr int currentHardLimitInmA = 8000;
       constexpr int currentIntegralRegulationGain = 7; // In Hz/A
     }
     namespace Runtime {
@@ -45,15 +45,19 @@ namespace Constants {
     constexpr uint8_t enableCurrentRegulationNot = 3;
     constexpr uint8_t statusLeds = 4;
   }
-  namespace EEPROMIndices {
-    constexpr int version = 0;
-    constexpr int currentSensorCalibrationValues = 1;
-    constexpr int minimumCurrent = 9;
-    constexpr int currentDeadBand = 11;
-    constexpr int currentHardLimit = 13;
-    constexpr int currentIntegralRegulationGain = 15;
-    constexpr int powerOnDelay = 17;
-  };
+  namespace EEPROMParameters {
+    namespace Indices {
+      constexpr int version = 0;
+      constexpr int currentSensorCalibrationValues = 1;
+      constexpr int minimumCurrent = 9;
+      constexpr int currentDeadBand = 11;
+      constexpr int currentHardLimit = 13;
+      constexpr int currentIntegralRegulationGain = 15;
+      constexpr int powerOnDelay = 17;
+      constexpr int diagnostics = 19;
+    };
+    constexpr int storeDiagnosticsTimedInterval = 60;
+  }
 }
 
 struct ApplicationVariables {
@@ -64,12 +68,17 @@ struct ApplicationVariables {
     uint16_t slopeAdcDelta;
   };
 
+  enum class IntegralRegulationAction {
+    none, up, down
+  };
+
   enum class LedIndicatorMode {
     none,
     singleCadence,
     recurringCadence,
     showDecimal
   };
+  enum class LedIndicatorInvertMode { nonInverted, inverted, invertedUntilCadenceComplete };
   struct CadenceElement {
     uint8_t numberOfPulses;
     uint16_t onDuration;
@@ -78,9 +87,8 @@ struct ApplicationVariables {
   };
   struct LedIndicatorInfo {
     bool ledOn;
-    bool inverted;
-    LedIndicatorMode mode;
-    // bool interruptCadenceRunning;
+    LedIndicatorMode mode = LedIndicatorMode::none;
+    LedIndicatorInvertMode invertMode = LedIndicatorInvertMode::nonInverted;
     unsigned long eventStartTime;
     uint16_t eventDuration;
     CadenceElement cadence[5];
@@ -95,6 +103,14 @@ struct ApplicationVariables {
     constexpr static uint8_t led2 = 1;
   };
 
+  struct Diagnostics {
+    int powerCycleCount;
+    int hardLimitReachedCount;
+    int maximumOutputReachedCount;
+    int minimumOutputReachedCount;
+    int spiErrorCount;
+  };
+
   CurrentSensorCalibrationValues currentSensorCalibrationValues;
   int minimumCurrentInmA;
   int currentDeadBandInmA;
@@ -104,16 +120,22 @@ struct ApplicationVariables {
   int powerOnDelay;
   bool powerOnDelayCompleted;
   bool debugMode;
-  bool regulationInhibited;
+  bool regulationEnabled;
   int currentSensorReadingCounter;
   uint32_t currentSensorReadingOversampledValueAccumulator;
   uint16_t currentSensorReadingLatestOversampledValue;
   bool currentSensorReadingSuspended;
   int currentSensorReadingSuspendedCountdown;
+  IntegralRegulationAction integralRegulationAction = IntegralRegulationAction::none;
   bool safeMode;
   unsigned long safeModeStartTime;
   int aggregatePotentiometerValue;
   LedIndicatorInfo ledIndicatorInfo[2];
+  Diagnostics diagnostics;
+  bool diagnosticsSPIErrorCountStored;
+  unsigned long storeDiagnosticsTimedIntervalStartTime;
+  bool storeDiagnosticsTimedIntervalActive;
+  bool diagnosticsDirty;
 } applicationVariables = {};
 
 void HandlePowerOnDelayCompleted();
@@ -126,18 +148,41 @@ void IncrementCurrent();
 void DecrementCurrent();
 void SetPotentiometers();
 void Blinker();
-void LedIndicatorStop();
+void LedIndicatorStop(int ledIndicatorLedNumber);
 void LedIndicatorAlive();
-void LedIndicatorRegulationAction();
-enum class LedIndicatorShowDecimalMode { waitUntilCadenceComplete, showImmediately };
-void LedIndicatorShowDecimal(int ledIndicatorLedNumber, int decimal, LedIndicatorShowDecimalMode ledIndicatorShowDecimalMode);
+enum class LedIndicatorRegulationActionMode { increment, decrement };
+void LedIndicatorRegulationAction(LedIndicatorRegulationActionMode ledIndicatorRegulationActionMode);
+void LedIndicatorShowDecimal(int ledIndicatorLedNumber, int decimal);
 void LedIndicatorBurst(int duration, int endDuration);
 void LedIndicatorPause(int duration);
-void LedIndicatorInvert(bool invert);
+void LedIndicatorInvert(int ledIndicatorLedNumber, ApplicationVariables::LedIndicatorInvertMode ledIndicatorInvertMode);
 void SetInitialSettings();
 void StoreSettings();
+void StoreDiagnosticsTimed();
+void StoreDiagnosticsImmediately();
 
 void setup() {
+  // Get configuration and diagnostics from EEPROM
+  // The only version we know is 1
+  if (EEPROM.read(Constants::EEPROMParameters::Indices::version) == 1) {
+    EEPROM.get(Constants::EEPROMParameters::Indices::currentSensorCalibrationValues, applicationVariables.currentSensorCalibrationValues);
+    EEPROM.get(Constants::EEPROMParameters::Indices::minimumCurrent, applicationVariables.minimumCurrentInmA);
+    EEPROM.get(Constants::EEPROMParameters::Indices::currentDeadBand, applicationVariables.currentDeadBandInmA);
+    EEPROM.get(Constants::EEPROMParameters::Indices::currentHardLimit, applicationVariables.currentHardLimitInmA);
+    EEPROM.get(Constants::EEPROMParameters::Indices::currentIntegralRegulationGain, applicationVariables.currentIntegralRegulationGain);
+    EEPROM.get(Constants::EEPROMParameters::Indices::powerOnDelay, applicationVariables.powerOnDelay);
+
+    EEPROM.get(Constants::EEPROMParameters::Indices::diagnostics, applicationVariables.diagnostics);
+  }
+  else {
+    // Initialise EEPROM so it can be used to store settings and diagnostics
+    EEPROM.write(Constants::EEPROMParameters::Indices::version, 1);
+    SetInitialSettings();
+    StoreSettings();
+
+    StoreDiagnosticsImmediately();
+  }
+
   // Initialize SPI
   SPI.begin();
   SPI.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
@@ -153,19 +198,9 @@ void setup() {
   // Show alive activity
   LedIndicatorAlive();
 
-  // Get configuration from EEPROM
-  // The only version we know is 1
-  if (EEPROM.read(Constants::EEPROMIndices::version) == 1) {
-    EEPROM.get(Constants::EEPROMIndices::currentSensorCalibrationValues, applicationVariables.currentSensorCalibrationValues);
-    EEPROM.get(Constants::EEPROMIndices::minimumCurrent, applicationVariables.minimumCurrentInmA);
-    EEPROM.get(Constants::EEPROMIndices::currentDeadBand, applicationVariables.currentDeadBandInmA);
-    EEPROM.get(Constants::EEPROMIndices::currentHardLimit, applicationVariables.currentHardLimitInmA);
-    EEPROM.get(Constants::EEPROMIndices::currentIntegralRegulationGain, applicationVariables.currentIntegralRegulationGain);
-    EEPROM.get(Constants::EEPROMIndices::powerOnDelay, applicationVariables.powerOnDelay);
-  }
-  else {
-    SetInitialSettings();
-  }
+  // Increment power cycle count and store
+  applicationVariables.diagnostics.powerCycleCount++;
+  StoreDiagnosticsImmediately();
 }
 
 void loop() {
@@ -176,13 +211,25 @@ void loop() {
     HandlePowerOnDelayCompleted();
   }
 
-  if (applicationVariables.powerOnDelayCompleted) {
-    MeasureAndRegulate();
-  }
+  MeasureAndRegulate();
   
   HandleButtonInput();
 
   Blinker();
+
+  if (
+    applicationVariables.storeDiagnosticsTimedIntervalActive &&
+    applicationVariables.currentTime - applicationVariables.storeDiagnosticsTimedIntervalStartTime >= Constants::EEPROMParameters::storeDiagnosticsTimedInterval * 1000000
+    ) {
+    if (applicationVariables.diagnosticsDirty) {
+      StoreDiagnosticsImmediately();
+      applicationVariables.storeDiagnosticsTimedIntervalStartTime = applicationVariables.currentTime;
+      applicationVariables.diagnosticsDirty = false;
+    }
+    else {
+      applicationVariables.storeDiagnosticsTimedIntervalActive = false;
+    }
+  }
 }
 
 void HandlePowerOnDelayCompleted() {
@@ -318,7 +365,7 @@ int CalculateCurrentChangeFrequency(int currentInmA, int setpointCurrentInmA) {
 
 void GoToSafeMode() {
   if (!applicationVariables.safeMode) {
-    // Set _safeMode first so that any function called below can call GoToSafeMode again without causing a loop
+    // Set safeMode first so that any function called below can call GoToSafeMode again without causing a loop
     applicationVariables.safeMode = true;
     applicationVariables.safeModeStartTime = applicationVariables.currentTime;
 
@@ -333,9 +380,6 @@ void MeasureAndRegulate() {
   static bool startFirstCurrentMeasureInterval = true;
   static unsigned long currentMeasureIntervalStartTime = 0;
   int currentInmA = 0;
-  static enum class CurrentIntegralRegulationAction {
-    none, up, down
-  } currentIntegralRegulationAction = CurrentIntegralRegulationAction::none;
   bool changeCurrentImmediately = false;
   static int changeFrequency = 0;
   // Perform sensor measurements at a fixed frequency
@@ -346,58 +390,63 @@ void MeasureAndRegulate() {
         // Go back to regulation mode when the current stays under the minimum for some time
         if (
           currentInmA < applicationVariables.minimumCurrentInmA &&
-          (applicationVariables.currentTime - applicationVariables.safeModeStartTime >= Constants::RegulationParameters::Runtime::safeModeTime * 1000000UL)
+          (applicationVariables.currentTime - applicationVariables.safeModeStartTime >= Constants::RegulationParameters::Runtime::safeModeTime * 1000000)
           ) {
           applicationVariables.safeMode = false;
           EnableRegulation();
         }
       }
       else {
-        if (!applicationVariables.regulationInhibited) {
+        if (applicationVariables.regulationEnabled) {
           // In normal regulation mode
-          if (currentInmA < applicationVariables.minimumCurrentInmA) {
-            // Current too low, regulate up
-            if (currentIntegralRegulationAction != CurrentIntegralRegulationAction::up) {
-              changeCurrentImmediately = true;
-            }
-            currentIntegralRegulationAction = CurrentIntegralRegulationAction::up;
-            changeFrequency = CalculateCurrentChangeFrequency(currentInmA, applicationVariables.minimumCurrentInmA);
-          }
-          else if (currentInmA > applicationVariables.currentHardLimitInmA) {
+          if (currentInmA > applicationVariables.currentHardLimitInmA) {
             // Current dangerously high, go to safe mode
             GoToSafeMode();
-          }
-          else if (currentInmA > applicationVariables.minimumCurrentInmA + applicationVariables.currentDeadBandInmA) {
-            // Current is too high, regulate down
-            if (currentIntegralRegulationAction != CurrentIntegralRegulationAction::down) {
-              changeCurrentImmediately = true;
-            }
-            currentIntegralRegulationAction = CurrentIntegralRegulationAction::down;
-            changeFrequency = CalculateCurrentChangeFrequency(currentInmA, applicationVariables.minimumCurrentInmA + applicationVariables.currentDeadBandInmA);
+
+            applicationVariables.diagnostics.hardLimitReachedCount++;
+            StoreDiagnosticsTimed();
           }
           else {
-            // Current is within dead band, do nothing
-            currentIntegralRegulationAction = CurrentIntegralRegulationAction::none;
+            if (currentInmA < applicationVariables.minimumCurrentInmA) {
+              // Current too low, regulate up
+              if (applicationVariables.integralRegulationAction != ApplicationVariables::IntegralRegulationAction::up) {
+                changeCurrentImmediately = true;
+              }
+              applicationVariables.integralRegulationAction = ApplicationVariables::IntegralRegulationAction::up;
+              changeFrequency = CalculateCurrentChangeFrequency(currentInmA, applicationVariables.minimumCurrentInmA);
+            }
+            else if (currentInmA > applicationVariables.minimumCurrentInmA + applicationVariables.currentDeadBandInmA) {
+              // Current is too high, regulate down
+              if (applicationVariables.integralRegulationAction != ApplicationVariables::IntegralRegulationAction::down) {
+                changeCurrentImmediately = true;
+              }
+              applicationVariables.integralRegulationAction = ApplicationVariables::IntegralRegulationAction::down;
+              changeFrequency = CalculateCurrentChangeFrequency(currentInmA, applicationVariables.minimumCurrentInmA + applicationVariables.currentDeadBandInmA);
+            }
+            else {
+              // Current is within dead band, do nothing
+              applicationVariables.integralRegulationAction = ApplicationVariables::IntegralRegulationAction::none;
+            }
           }
         }
       }
 
-      LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led1, currentInmA / 100, LedIndicatorShowDecimalMode::waitUntilCadenceComplete);
+      LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led1, currentInmA / 100);
     }
   }
 
   // Integral regulation actions are done at their own frequency, independent from sensor measurements
-  if (!applicationVariables.safeMode && currentIntegralRegulationAction != CurrentIntegralRegulationAction::none) {
+  if (applicationVariables.regulationEnabled && applicationVariables.integralRegulationAction != ApplicationVariables::IntegralRegulationAction::none) {
     static unsigned long regulateIntervalStartTime = 0;
     if (RunAtFrequency(changeCurrentImmediately, regulateIntervalStartTime, changeFrequency)) {
-      switch (currentIntegralRegulationAction) {
-      case CurrentIntegralRegulationAction::up:
+      switch (applicationVariables.integralRegulationAction) {
+      case ApplicationVariables::IntegralRegulationAction::up:
         IncrementCurrent();
         break;
-      case CurrentIntegralRegulationAction::down:
+      case ApplicationVariables::IntegralRegulationAction::down:
         DecrementCurrent();
         break;
-      case CurrentIntegralRegulationAction::none:
+      case ApplicationVariables::IntegralRegulationAction::none:
         break;
       }
     }
@@ -406,10 +455,13 @@ void MeasureAndRegulate() {
 
 void EnableRegulation() {
   digitalWrite(Constants::Pins::enableCurrentRegulationNot, 0);
+  applicationVariables.regulationEnabled = true;
 }
 
 void DisableRegulation() {
   digitalWrite(Constants::Pins::enableCurrentRegulationNot, 1);
+  applicationVariables.regulationEnabled = false;
+  applicationVariables.integralRegulationAction = ApplicationVariables::IntegralRegulationAction::none;
 }
 
 void SetLowestCurrent() {
@@ -421,15 +473,26 @@ void IncrementCurrent() {
   if (applicationVariables.aggregatePotentiometerValue < 512) {
     applicationVariables.aggregatePotentiometerValue++;
     SetPotentiometers();
+
+    if (applicationVariables.aggregatePotentiometerValue == 512) {
+      applicationVariables.diagnostics.maximumOutputReachedCount++;
+      StoreDiagnosticsTimed();
+    }
   }
-  LedIndicatorRegulationAction();
+  LedIndicatorRegulationAction(LedIndicatorRegulationActionMode::increment);
 }
 
 void DecrementCurrent() {
   if (applicationVariables.aggregatePotentiometerValue > 0) {
     applicationVariables.aggregatePotentiometerValue--;
     SetPotentiometers();
+
+    if (applicationVariables.aggregatePotentiometerValue == 0) {
+      applicationVariables.diagnostics.minimumOutputReachedCount++;
+      StoreDiagnosticsTimed();
+    }
   }
+  LedIndicatorRegulationAction(LedIndicatorRegulationActionMode::decrement);
 }
 
 void SetPotentiometers() {
@@ -442,6 +505,12 @@ void SetPotentiometers() {
     // Expected are 7 bits set to "1" followed by the value
     if (SPI.transfer16(0x0C00) != (0xFE00 | ((applicationVariables.aggregatePotentiometerValue + 1) / 2))) {
       GoToSafeMode();
+
+      if (!applicationVariables.diagnosticsSPIErrorCountStored) {
+        applicationVariables.diagnostics.spiErrorCount++;
+        StoreDiagnosticsImmediately();
+        applicationVariables.diagnosticsSPIErrorCountStored = true;
+      }
     }
   }
 }
@@ -506,7 +575,7 @@ void HandleButtonInput() {
     if (!handlingParameter) {
       // The indicator may be showing a burst on entry of the parameter setting
       // Show the decimal after that cadence has completed
-      LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, parameter / scaleDownForLedIndicator, LedIndicatorShowDecimalMode::waitUntilCadenceComplete);
+      LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, parameter / scaleDownForLedIndicator);
       handlingParameter = true;
     }
     if (buttonEvent == ButtonEvent::shortPress) {
@@ -518,8 +587,10 @@ void HandleButtonInput() {
           parameter -= delta;
         }
       }
-      // Immediately show the updated parameter
-      LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, parameter / scaleDownForLedIndicator, LedIndicatorShowDecimalMode::showImmediately);
+      // Show the updated parameter
+      // First pause for a while to improve "readability"
+      LedIndicatorPause(500);
+      LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, parameter / scaleDownForLedIndicator);
       // Reset because of short press
       consecutiveLongPresses = 0;
       return HandleUpDownParameterResult::parameterChanged;
@@ -527,7 +598,7 @@ void HandleButtonInput() {
     else if (buttonEvent == ButtonEvent::longPress) {
       // Two consecutive long presses end this parameter setting
       if (++consecutiveLongPresses == 2) {
-        LedIndicatorStop();
+        LedIndicatorStop(ApplicationVariables::LedIndicatorLedNumber::led2);
 
         // Reset for next parameter
         handlingParameter = false;
@@ -539,11 +610,12 @@ void HandleButtonInput() {
         // Change direction on long press
         if (direction == Direction::up) {
           direction = Direction::down;
+          LedIndicatorInvert(ApplicationVariables::LedIndicatorLedNumber::led2, ApplicationVariables::LedIndicatorInvertMode::inverted);
         }
         else {
           direction = Direction::up;
+          LedIndicatorInvert(ApplicationVariables::LedIndicatorLedNumber::led2, ApplicationVariables::LedIndicatorInvertMode::nonInverted);
         }
-        LedIndicatorInvert(direction == Direction::down);
         // To improve "readability" of the indicator after inversion, pause for a while before
         // the parameter is shown again
         LedIndicatorPause(1000);
@@ -563,48 +635,66 @@ void HandleButtonInput() {
     twoPointCalibration, twoPointCalibrationPoint1SetValue, twoPointCalibrationPoint1ControlOutputCoarse, twoPointCalibrationPoint1ControlOutputFine, twoPointCalibrationPoint2SetValue, twoPointCalibrationPoint2ControlOutputCoarse, twoPointCalibrationPoint2ControlOutputFine,
     integralRegulationGain, integralRegulationGainSetting,
     testDisableRegulation, testDisableRegulationSetting,
-    resetToInitialSettings, resetToInitialSettingsShowingBurst
+    resetToInitialSettings,
+    diagnostics, diagnosticsPowerCycleCount, diagnosticsHardLimitReachedCount, diagnosticsMaximumOutputReachedCount, diagnosticsMinimumOutputReachedCount, diagnosticsSpiErrorCount
   } menuMode = MenuMode::off;
+  static int8_t menuModeToMenuNumber[] = {
+    0,
+    1,0,
+    2,0,
+    3,0,
+    4,0,
+    5,0,0,0,0,0,0,
+    6,0,
+    7,0,
+    8,
+    9,0,0,0,0,0
+  };
   // Some lambda's for stepping through the menu
-  auto NextMenuMode = [](MenuMode nextMenuMode, bool showBurst, int burstDuration, bool showDecimal, int decimal) {
+  auto NextMenuModeAllParameters = [](MenuMode nextMenuMode, bool showBurst, int burstDuration, bool showDecimal, int decimal) {
     if (showBurst) {
       // Start burst and, in case a decimal needs to be shown, setup to show it after the burst
       LedIndicatorBurst(burstDuration, 1000);
       if (showDecimal) {
-        LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, decimal, LedIndicatorShowDecimalMode::waitUntilCadenceComplete);
+        LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, decimal);
       }
     }
     else {
       if (showDecimal) {
-        // No burst, immediately show the decimal even if a decimal was being shown
-        LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, decimal, LedIndicatorShowDecimalMode::showImmediately);
+        // No burst, show the decimal
+        // First pause for a while to improve "readability"
+        LedIndicatorPause(500);
+        LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, decimal);
       }
       else {
-        LedIndicatorStop();
+        LedIndicatorStop(ApplicationVariables::LedIndicatorLedNumber::led2);
       }
     }
     menuMode = nextMenuMode;
   };
-  auto NextMenuModeWithBurstAndDecimal = [NextMenuMode](MenuMode nextMenuMode, int burstDuration, int decimal) {
-    NextMenuMode(nextMenuMode, true, burstDuration, true, decimal);
+  auto NextMenuMode = [NextMenuModeAllParameters](MenuMode nextMenuMode) {
+    NextMenuModeAllParameters(nextMenuMode, false, 0, false, 0);
   };
-  auto NextMenuModeWithBurst = [NextMenuMode](MenuMode nextMenuMode, int burstDuration) {
-    NextMenuMode(nextMenuMode, true, burstDuration, false, 0);
+  auto NextMenuModeWithBurst = [NextMenuModeAllParameters](MenuMode nextMenuMode, int burstDuration) {
+    NextMenuModeAllParameters(nextMenuMode, true, burstDuration, false, 0);
   };
-  auto NextMenuModeWithDecimal = [NextMenuMode](MenuMode nextMenuMode, int decimal) {
-    NextMenuMode(nextMenuMode, false, 0, true, decimal);
+  auto NextMainMenuMode = [NextMenuModeAllParameters](MenuMode nextMenuMode) {
+    NextMenuModeAllParameters(nextMenuMode, false, 0, true, menuModeToMenuNumber[(int)nextMenuMode]);
+  };
+  auto NextMainMenuModeWithBurst = [NextMenuModeAllParameters](MenuMode nextMenuMode, int burstDuration) {
+    NextMenuModeAllParameters(nextMenuMode, true, burstDuration, true, menuModeToMenuNumber[(int)nextMenuMode]);
   };
   static int integerSettingParameter = 0;
   static bool booleanSettingParameter = false;
   switch (menuMode) {
   case MenuMode::off:
     if (buttonEvent == ButtonEvent::longPress) {
-      NextMenuModeWithBurstAndDecimal(MenuMode::minimumCurrent, 1000, 1);
+      NextMainMenuModeWithBurst(MenuMode::minimumCurrent, 1000);
     }
     break;
   case MenuMode::minimumCurrent:
     if (buttonEvent == ButtonEvent::shortPress) {
-      NextMenuModeWithDecimal(MenuMode::deadBand, 2);
+      NextMainMenuMode(MenuMode::deadBand);
     }
     else if (buttonEvent == ButtonEvent::longPress) {
       NextMenuModeWithBurst(MenuMode::minimumCurrentSetting, 250);
@@ -613,12 +703,12 @@ void HandleButtonInput() {
   case MenuMode::minimumCurrentSetting:
     if (HandleUpDownParameter(applicationVariables.minimumCurrentInmA, 100, 100) == HandleUpDownParameterResult::done) {
       StoreSettings();
-      NextMenuModeWithBurstAndDecimal(MenuMode::minimumCurrent, 3000, 1);
+      NextMainMenuModeWithBurst(MenuMode::minimumCurrent, 3000);
     }
     break;
   case MenuMode::deadBand:
     if (buttonEvent == ButtonEvent::shortPress) {
-      NextMenuModeWithDecimal(MenuMode::hardLimitCurrent, 3);
+      NextMainMenuMode(MenuMode::hardLimitCurrent);
     }
     else if (buttonEvent == ButtonEvent::longPress) {
       NextMenuModeWithBurst(MenuMode::deadBandSetting, 250);
@@ -627,12 +717,12 @@ void HandleButtonInput() {
   case MenuMode::deadBandSetting:
     if (HandleUpDownParameter(applicationVariables.currentDeadBandInmA, 100, 100) == HandleUpDownParameterResult::done) {
       StoreSettings();
-      NextMenuModeWithBurstAndDecimal(MenuMode::deadBand, 3000, 2);
+      NextMainMenuModeWithBurst(MenuMode::deadBand, 3000);
     }
     break;
   case MenuMode::hardLimitCurrent:
     if (buttonEvent == ButtonEvent::shortPress) {
-      NextMenuModeWithDecimal(MenuMode::powerOnDelay, 4);
+      NextMainMenuMode(MenuMode::powerOnDelay);
     }
     else if (buttonEvent == ButtonEvent::longPress) {
       NextMenuModeWithBurst(MenuMode::hardLimitCurrentSetting, 250);
@@ -641,12 +731,12 @@ void HandleButtonInput() {
   case MenuMode::hardLimitCurrentSetting:
     if (HandleUpDownParameter(applicationVariables.currentHardLimitInmA, 100, 100) == HandleUpDownParameterResult::done) {
       StoreSettings();
-      NextMenuModeWithBurstAndDecimal(MenuMode::hardLimitCurrent, 3000, 3);
+      NextMainMenuModeWithBurst(MenuMode::hardLimitCurrent, 3000);
     }
     break;
   case MenuMode::powerOnDelay:
     if (buttonEvent == ButtonEvent::shortPress) {
-      NextMenuModeWithDecimal(MenuMode::twoPointCalibration, 5);
+      NextMainMenuMode(MenuMode::twoPointCalibration);
     }
     else if (buttonEvent == ButtonEvent::longPress) {
       NextMenuModeWithBurst(MenuMode::powerOnDelaySetting, 250);
@@ -655,15 +745,15 @@ void HandleButtonInput() {
   case MenuMode::powerOnDelaySetting:
     if (HandleUpDownParameter(applicationVariables.powerOnDelay) == HandleUpDownParameterResult::done) {
       StoreSettings();
-      NextMenuModeWithBurstAndDecimal(MenuMode::powerOnDelay, 3000, 4);
+      NextMainMenuModeWithBurst(MenuMode::powerOnDelay, 3000);
     }
     break;
   case MenuMode::twoPointCalibration:
     if (buttonEvent == ButtonEvent::shortPress) {
-      NextMenuModeWithDecimal(MenuMode::integralRegulationGain, 6);
+      NextMainMenuMode(MenuMode::integralRegulationGain);
     }
     else if (buttonEvent == ButtonEvent::longPress) {
-      applicationVariables.regulationInhibited = true;
+      applicationVariables.regulationEnabled = false;
       applicationVariables.aggregatePotentiometerValue = 0;
       SetPotentiometers();
       NextMenuModeWithBurst(MenuMode::twoPointCalibrationPoint1SetValue, 250);
@@ -726,7 +816,8 @@ void HandleButtonInput() {
     case HandleUpDownParameterResult::done:
       applicationVariables.currentSensorCalibrationValues.slopeAdcDelta = applicationVariables.currentSensorReadingLatestOversampledValue - applicationVariables.currentSensorCalibrationValues.adcReferencePoint;
       StoreSettings();
-      NextMenuModeWithBurstAndDecimal(MenuMode::twoPointCalibration, 3000, 5);
+      applicationVariables.regulationEnabled = true;
+      NextMainMenuModeWithBurst(MenuMode::twoPointCalibration, 3000);
       break;
     case HandleUpDownParameterResult::working:
       break;
@@ -734,7 +825,7 @@ void HandleButtonInput() {
     break;
   case MenuMode::integralRegulationGain:
     if (buttonEvent == ButtonEvent::shortPress) {
-      NextMenuModeWithDecimal(MenuMode::testDisableRegulation, 7);
+      NextMainMenuMode(MenuMode::testDisableRegulation);
     }
     else if (buttonEvent == ButtonEvent::longPress) {
       NextMenuModeWithBurst(MenuMode::integralRegulationGainSetting, 250);
@@ -743,12 +834,12 @@ void HandleButtonInput() {
   case MenuMode::integralRegulationGainSetting:
     if (HandleUpDownParameter(applicationVariables.currentIntegralRegulationGain) == HandleUpDownParameterResult::done) {
       StoreSettings();
-      NextMenuModeWithBurstAndDecimal(MenuMode::integralRegulationGain, 3000, 6);
+      NextMainMenuModeWithBurst(MenuMode::integralRegulationGain, 3000);
     }
     break;
   case MenuMode::testDisableRegulation:
     if (buttonEvent == ButtonEvent::shortPress) {
-      NextMenuModeWithDecimal(MenuMode::resetToInitialSettings, 8);
+      NextMainMenuMode(MenuMode::resetToInitialSettings);
     }
     else if (buttonEvent == ButtonEvent::longPress) {
       // Prepare for testDisableRegulationSetting
@@ -769,35 +860,87 @@ void HandleButtonInput() {
     }
     else if (buttonEvent == ButtonEvent::longPress) {
       EnableRegulation();
-      NextMenuModeWithBurstAndDecimal(MenuMode::testDisableRegulation, 3000, 7);
+      NextMainMenuModeWithBurst(MenuMode::testDisableRegulation, 250);
     }
     break;
   case MenuMode::resetToInitialSettings:
+    if (buttonEvent == ButtonEvent::shortPress) {
+      NextMainMenuMode(MenuMode::diagnostics);
+    }
+    else if (buttonEvent == ButtonEvent::longPress) {
+      SetInitialSettings();
+      StoreSettings();
+      NextMainMenuModeWithBurst(MenuMode::resetToInitialSettings, 5000);
+    }
+    break;
+  case MenuMode::diagnostics:
     if (buttonEvent == ButtonEvent::shortPress) {
       LedIndicatorAlive();
       menuMode = MenuMode::off;
     }
     else if (buttonEvent == ButtonEvent::longPress) {
-      SetInitialSettings();
-      StoreSettings();
-      NextMenuModeWithBurst(MenuMode::resetToInitialSettingsShowingBurst, 5000);
+      NextMenuModeWithBurst(MenuMode::diagnosticsPowerCycleCount, 250);
     }
     break;
-  case MenuMode::resetToInitialSettingsShowingBurst:
-    // Wait for the burst to complete before exiting menu
-    if (applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].mode == ApplicationVariables::LedIndicatorMode::none) {
-      LedIndicatorAlive();
-      menuMode = MenuMode::off;
+  case MenuMode::diagnosticsPowerCycleCount:
+    LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, applicationVariables.diagnostics.powerCycleCount);
+    if (buttonEvent == ButtonEvent::shortPress) {
+      NextMenuMode(MenuMode::diagnosticsMaximumOutputReachedCount);
+    }
+    else if (buttonEvent == ButtonEvent::longPress) {
+      applicationVariables.diagnostics.powerCycleCount = 0;
+      StoreDiagnosticsImmediately();
+      LedIndicatorBurst(5000, 1000);
+    }
+    break;
+  case MenuMode::diagnosticsMaximumOutputReachedCount:
+    LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, applicationVariables.diagnostics.maximumOutputReachedCount);
+    if (buttonEvent == ButtonEvent::shortPress) {
+      NextMenuMode(MenuMode::diagnosticsMinimumOutputReachedCount);
+    }
+    else if (buttonEvent == ButtonEvent::longPress) {
+      applicationVariables.diagnostics.maximumOutputReachedCount = 0;
+      StoreDiagnosticsImmediately();
+      LedIndicatorBurst(5000, 1000);
+    }
+    break;
+  case MenuMode::diagnosticsMinimumOutputReachedCount:
+    LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, applicationVariables.diagnostics.minimumOutputReachedCount);
+    if (buttonEvent == ButtonEvent::shortPress) {
+      NextMenuMode(MenuMode::diagnosticsHardLimitReachedCount);
+    }
+    else if (buttonEvent == ButtonEvent::longPress) {
+      applicationVariables.diagnostics.minimumOutputReachedCount = 0;
+      StoreDiagnosticsImmediately();
+      LedIndicatorBurst(5000, 1000);
+    }
+    break;
+  case MenuMode::diagnosticsHardLimitReachedCount:
+    LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, applicationVariables.diagnostics.hardLimitReachedCount);
+    if (buttonEvent == ButtonEvent::shortPress) {
+      NextMenuMode(MenuMode::diagnosticsSpiErrorCount);
+    }
+    else if (buttonEvent == ButtonEvent::longPress) {
+      applicationVariables.diagnostics.hardLimitReachedCount = 0;
+      StoreDiagnosticsImmediately();
+      LedIndicatorBurst(5000, 1000);
+    }
+    break;
+  case MenuMode::diagnosticsSpiErrorCount:
+    LedIndicatorShowDecimal(ApplicationVariables::LedIndicatorLedNumber::led2, applicationVariables.diagnostics.spiErrorCount);
+    if (buttonEvent == ButtonEvent::shortPress) {
+      NextMainMenuModeWithBurst(MenuMode::diagnostics, 250);
+    }
+    else if (buttonEvent == ButtonEvent::longPress) {
+      applicationVariables.diagnostics.spiErrorCount = 0;
+      StoreDiagnosticsImmediately();
+      LedIndicatorBurst(5000, 1000);
     }
     break;
   }
 }
 
 void LedIndicatorShowNewDecimal(ApplicationVariables::LedIndicatorInfo& ledIndicatorInfo) {
-  // // If interrupt cadence is running do not set up a new cadence
-  // if (ledIndicatorInfo.interruptCadenceRunning) {
-  //   return;
-  // }
   // Hundreds
   uint8_t numberOfPulses = ledIndicatorInfo.showDecimalNumber / 100;
   if (numberOfPulses > 0) {
@@ -832,7 +975,7 @@ void LedIndicatorShowNewDecimal(ApplicationVariables::LedIndicatorInfo& ledIndic
 
 void RunLedIndicator(ApplicationVariables::LedIndicatorInfo& ledIndicatorInfo) {
   if (
-    (ledIndicatorInfo.mode != ApplicationVariables::LedIndicatorMode::none /*|| ledIndicatorInfo.interruptCadenceRunning*/) &&
+    (ledIndicatorInfo.mode != ApplicationVariables::LedIndicatorMode::none) &&
     (applicationVariables.currentTime - ledIndicatorInfo.eventStartTime >= (unsigned long)ledIndicatorInfo.eventDuration * 1000UL)
     ) {
     ledIndicatorInfo.eventStartTime = applicationVariables.currentTime;
@@ -858,10 +1001,9 @@ void RunLedIndicator(ApplicationVariables::LedIndicatorInfo& ledIndicatorInfo) {
         ledIndicatorInfo.cadenceIndex = (ledIndicatorInfo.cadenceIndex + 1) % ledIndicatorInfo.cadenceLength;
         if (ledIndicatorInfo.cadenceIndex == 0) {
           // We're at the start of the cadence sequence again
-          // if (ledIndicatorInfo.interruptCadenceRunning) {
-          //   // This was an interrupt cadence and has now ended
-          //   ledIndicatorInfo.interruptCadenceRunning = false;
-          // }
+          if (ledIndicatorInfo.invertMode == ApplicationVariables::LedIndicatorInvertMode::invertedUntilCadenceComplete) {
+            ledIndicatorInfo.invertMode = ApplicationVariables::LedIndicatorInvertMode::nonInverted;
+          }
           switch (ledIndicatorInfo.mode) {
           case ApplicationVariables::LedIndicatorMode::none:
             // Nothing to do so stop
@@ -906,7 +1048,14 @@ void Blinker() {
   static unsigned long multiplexIntervalStartTime = 0;
   static uint8_t multiplexSelector = ApplicationVariables::LedIndicatorLedNumber::led1;
   if (RunAtFrequency(startFirstMultiplexInterval, multiplexIntervalStartTime, Constants::Frequencies::blinkerFrequency)) {
-    if (applicationVariables.ledIndicatorInfo[multiplexSelector].ledOn != applicationVariables.ledIndicatorInfo[multiplexSelector].inverted) {
+    bool ledOn = false;
+    if (applicationVariables.ledIndicatorInfo[multiplexSelector].invertMode == ApplicationVariables::LedIndicatorInvertMode::nonInverted) {
+      ledOn = applicationVariables.ledIndicatorInfo[multiplexSelector].ledOn;
+    }
+    else {
+      ledOn = !applicationVariables.ledIndicatorInfo[multiplexSelector].ledOn;
+    }
+    if (ledOn) {
       digitalWrite(Constants::Pins::statusLeds, multiplexSelector == ApplicationVariables::LedIndicatorLedNumber::led1 ? 1 : 0);
       pinMode(Constants::Pins::statusLeds, OUTPUT);
     }
@@ -922,18 +1071,7 @@ void Blinker() {
   }
 }
 
-void LedIndicatorStartCadence(ApplicationVariables::LedIndicatorInfo& ledIndicatorInfo/*, bool isInterruptCadence = false*/) {
-  // if (isInterruptCadence) {
-  //   // This cadence will interrupt any running cadence and prohibit new cadences from being started
-  //   ledIndicatorInfo.interruptCadenceRunning = true;
-  // }
-  // else {
-  //   // Normal cadence
-  //   // If interrupt cadence is running do not start a new cadence
-  //   if (ledIndicatorInfo.interruptCadenceRunning) {
-  //     return;
-  //   }
-  // }
+void LedIndicatorStartCadence(ApplicationVariables::LedIndicatorInfo& ledIndicatorInfo) {
   ledIndicatorInfo.ledOn = true;
   ledIndicatorInfo.eventStartTime = applicationVariables.currentTime;
   ledIndicatorInfo.eventDuration = ledIndicatorInfo.cadence[0].onDuration;
@@ -941,10 +1079,11 @@ void LedIndicatorStartCadence(ApplicationVariables::LedIndicatorInfo& ledIndicat
   ledIndicatorInfo.cadencePulseCounter = 1;
 }
 
-void LedIndicatorStop() {
-  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].ledOn = false;
-  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].inverted = false;
-  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].mode = ApplicationVariables::LedIndicatorMode::none;
+void LedIndicatorStop(int ledIndicatorLedNumber) {
+  ApplicationVariables::LedIndicatorInfo& ledIndicatorInfo = applicationVariables.ledIndicatorInfo[ledIndicatorLedNumber];
+  ledIndicatorInfo.ledOn = false;
+  ledIndicatorInfo.invertMode = ApplicationVariables::LedIndicatorInvertMode::nonInverted;
+  ledIndicatorInfo.mode = ApplicationVariables::LedIndicatorMode::none;
 }
 
 void LedIndicatorAlive() {
@@ -957,7 +1096,7 @@ void LedIndicatorAlive() {
   LedIndicatorStartCadence(applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2]);
 }
 
-void LedIndicatorRegulationAction() {
+void LedIndicatorRegulationAction(LedIndicatorRegulationActionMode ledIndicatorRegulationActionMode) {
   // This will always be shown immediately and we want the active mode to resume afterwards
   // Therefore the mode is not changed. Only when the mode currently is LedIndicatorMode::none,
   // we set it to LedIndicatorMode::singleCadence so other functions know a cadance is running
@@ -965,29 +1104,27 @@ void LedIndicatorRegulationAction() {
     applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led1].mode = ApplicationVariables::LedIndicatorMode::singleCadence;
   }
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led1].cadence[0].numberOfPulses = 1;
-  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led1].cadence[0].onDuration = 11;
+  if (ledIndicatorRegulationActionMode == LedIndicatorRegulationActionMode::increment) {
+    applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led1].cadence[0].onDuration = 11;
+  }
+  else {
+    LedIndicatorInvert(ApplicationVariables::LedIndicatorLedNumber::led1, ApplicationVariables::LedIndicatorInvertMode::invertedUntilCadenceComplete);
+    applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led1].cadence[0].onDuration = 50;
+  }
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led1].cadence[0].offDuration = 2000;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led1].cadence[0].endDuration = 0;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led1].cadenceLength = 1;
-  // // We interrupt the current indication on LED 1 to show regulation action
-  // // It will be restarted after the interrupt
-  LedIndicatorStartCadence(applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led1]/*, false*/);
+  LedIndicatorStartCadence(applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led1]);
 }
 
-void LedIndicatorShowDecimal(int ledIndicatorLedNumber, int decimal, LedIndicatorShowDecimalMode ledIndicatorShowDecimalMode) {
+void LedIndicatorShowDecimal(int ledIndicatorLedNumber, int decimal) {
   ApplicationVariables::LedIndicatorInfo& ledIndicatorInfo = applicationVariables.ledIndicatorInfo[ledIndicatorLedNumber];
-  // If LedIndicatorShowDecimalMode::waitUntilCadenceComplete is requested the decimal should only be shown
-  // after an active cadance has completed (which could be a decimal that is currently being shown)
-  // If LedIndicatorShowDecimalMode::showImmediately is requested the decimal must be shown right away
   // Always update the decimal
   // If it is not immediately shown the indicator will pick it up when it's ready
   ledIndicatorInfo.showDecimalNumber = decimal;
-  // For LedIndicatorShowDecimalMode::waitUntilCadenceComplete we should still show the decimal immediately if
-  // the indicator is doing nothing at the moment
-  if (
-    (ledIndicatorShowDecimalMode == LedIndicatorShowDecimalMode::waitUntilCadenceComplete && ledIndicatorInfo.mode == ApplicationVariables::LedIndicatorMode::none) ||
-    ledIndicatorShowDecimalMode == LedIndicatorShowDecimalMode::showImmediately
-    ) {
+  // If the indicator is doing nothing at the moment show the decimal immediately, else wait until the
+  // current cadence has completed (which could be a decimal that is currently being shown)
+  if (ledIndicatorInfo.mode == ApplicationVariables::LedIndicatorMode::none) {
     if (decimal > 0) {
       ledIndicatorInfo.mode = ApplicationVariables::LedIndicatorMode::showDecimal;
       LedIndicatorShowNewDecimal(ledIndicatorInfo);
@@ -996,7 +1133,7 @@ void LedIndicatorShowDecimal(int ledIndicatorLedNumber, int decimal, LedIndicato
     else {
       // Value must be shown immediately, but it is 0
       // Stop indication
-      LedIndicatorStop();
+      LedIndicatorStop(ledIndicatorLedNumber);
     }
   }
   else {
@@ -1033,8 +1170,8 @@ void LedIndicatorPause(int duration) {
   }
 }
 
-void LedIndicatorInvert(bool invert) {
-  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].inverted = invert;
+void LedIndicatorInvert(int ledIndicatorLedNumber, ApplicationVariables::LedIndicatorInvertMode ledIndicatorInvertMode) {
+  applicationVariables.ledIndicatorInfo[ledIndicatorLedNumber].invertMode = ledIndicatorInvertMode;
 }
 
 void SetInitialSettings() {
@@ -1050,11 +1187,25 @@ void SetInitialSettings() {
 }
 
 void StoreSettings() {
-  EEPROM.write(Constants::EEPROMIndices::version, 1);
-  EEPROM.put(Constants::EEPROMIndices::currentSensorCalibrationValues, applicationVariables.currentSensorCalibrationValues);
-  EEPROM.put(Constants::EEPROMIndices::minimumCurrent, applicationVariables.minimumCurrentInmA);
-  EEPROM.put(Constants::EEPROMIndices::currentDeadBand, applicationVariables.currentDeadBandInmA);
-  EEPROM.put(Constants::EEPROMIndices::currentHardLimit, applicationVariables.currentHardLimitInmA);
-  EEPROM.put(Constants::EEPROMIndices::currentIntegralRegulationGain, applicationVariables.currentIntegralRegulationGain);
-  EEPROM.put(Constants::EEPROMIndices::powerOnDelay, applicationVariables.powerOnDelay);
+  EEPROM.put(Constants::EEPROMParameters::Indices::currentSensorCalibrationValues, applicationVariables.currentSensorCalibrationValues);
+  EEPROM.put(Constants::EEPROMParameters::Indices::minimumCurrent, applicationVariables.minimumCurrentInmA);
+  EEPROM.put(Constants::EEPROMParameters::Indices::currentDeadBand, applicationVariables.currentDeadBandInmA);
+  EEPROM.put(Constants::EEPROMParameters::Indices::currentHardLimit, applicationVariables.currentHardLimitInmA);
+  EEPROM.put(Constants::EEPROMParameters::Indices::currentIntegralRegulationGain, applicationVariables.currentIntegralRegulationGain);
+  EEPROM.put(Constants::EEPROMParameters::Indices::powerOnDelay, applicationVariables.powerOnDelay);
+}
+
+void StoreDiagnosticsTimed() {
+  if (applicationVariables.storeDiagnosticsTimedIntervalActive) {
+    applicationVariables.diagnosticsDirty = true;
+  }
+  else {
+    StoreDiagnosticsImmediately();
+    applicationVariables.storeDiagnosticsTimedIntervalStartTime = applicationVariables.currentTime;
+    applicationVariables.storeDiagnosticsTimedIntervalActive = true;
+  }
+}
+
+void StoreDiagnosticsImmediately() {
+  EEPROM.put(Constants::EEPROMParameters::Indices::diagnostics, applicationVariables.diagnostics);
 }
