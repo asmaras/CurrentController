@@ -154,6 +154,7 @@ enum class LedIndicatorRegulationActionMode { increment, decrement };
 void LedIndicatorRegulationAction(LedIndicatorRegulationActionMode ledIndicatorRegulationActionMode);
 void LedIndicatorShowDecimal(int ledIndicatorLedNumber, int decimal);
 void LedIndicatorBurst(int duration, int endDuration);
+void LedIndicatorPanic();
 void LedIndicatorPause(int duration);
 void LedIndicatorInvert(int ledIndicatorLedNumber, ApplicationVariables::LedIndicatorInvertMode ledIndicatorInvertMode);
 void SetInitialSettings();
@@ -623,7 +624,7 @@ void HandleButtonInput() {
     }
 
     return HandleUpDownParameterResult::working;
-  };
+    };
 
   // Handle the menu
   static enum class MenuMode {
@@ -635,7 +636,7 @@ void HandleButtonInput() {
     twoPointCalibration, twoPointCalibrationPoint1SetValue, twoPointCalibrationPoint1ControlOutputCoarse, twoPointCalibrationPoint1ControlOutputFine, twoPointCalibrationPoint2SetValue, twoPointCalibrationPoint2ControlOutputCoarse, twoPointCalibrationPoint2ControlOutputFine,
     integralRegulationGain, integralRegulationGainSetting,
     testDisableRegulation, testDisableRegulationSetting,
-    resetToInitialSettings,
+    resetToInitialSettings, resetToInitialSettingsPanickyFlashAreYouSure,
     diagnostics, diagnosticsPowerCycleCount, diagnosticsHardLimitReachedCount, diagnosticsMaximumOutputReachedCount, diagnosticsMinimumOutputReachedCount, diagnosticsSpiErrorCount
   } menuMode = MenuMode::off;
   static int8_t menuModeToMenuNumber[] = {
@@ -647,7 +648,7 @@ void HandleButtonInput() {
     5,0,0,0,0,0,0,
     6,0,
     7,0,
-    8,
+    8,0,
     9,0,0,0,0,0
   };
   // Some lambda's for stepping through the menu
@@ -671,19 +672,19 @@ void HandleButtonInput() {
       }
     }
     menuMode = nextMenuMode;
-  };
+    };
   auto NextMenuMode = [NextMenuModeAllParameters](MenuMode nextMenuMode) {
     NextMenuModeAllParameters(nextMenuMode, false, 0, false, 0);
-  };
+    };
   auto NextMenuModeWithBurst = [NextMenuModeAllParameters](MenuMode nextMenuMode, int burstDuration) {
     NextMenuModeAllParameters(nextMenuMode, true, burstDuration, false, 0);
-  };
+    };
   auto NextMainMenuMode = [NextMenuModeAllParameters](MenuMode nextMenuMode) {
     NextMenuModeAllParameters(nextMenuMode, false, 0, true, menuModeToMenuNumber[(int)nextMenuMode]);
-  };
+    };
   auto NextMainMenuModeWithBurst = [NextMenuModeAllParameters](MenuMode nextMenuMode, int burstDuration) {
     NextMenuModeAllParameters(nextMenuMode, true, burstDuration, true, menuModeToMenuNumber[(int)nextMenuMode]);
-  };
+    };
   static int integerSettingParameter = 0;
   static bool booleanSettingParameter = false;
   switch (menuMode) {
@@ -866,6 +867,15 @@ void HandleButtonInput() {
   case MenuMode::resetToInitialSettings:
     if (buttonEvent == ButtonEvent::shortPress) {
       NextMainMenuMode(MenuMode::diagnostics);
+    }
+    else if (buttonEvent == ButtonEvent::longPress) {
+      NextMenuMode(MenuMode::resetToInitialSettingsPanickyFlashAreYouSure);
+      LedIndicatorPanic();
+    }
+    break;
+  case MenuMode::resetToInitialSettingsPanickyFlashAreYouSure:
+    if (buttonEvent == ButtonEvent::shortPress) {
+      NextMainMenuModeWithBurst(MenuMode::resetToInitialSettings, 250);
     }
     else if (buttonEvent == ButtonEvent::longPress) {
       SetInitialSettings();
@@ -1148,11 +1158,25 @@ void LedIndicatorBurst(int duration, int endDuration) {
   constexpr int onDuration = 15;
   constexpr int offDuration = 30;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].mode = ApplicationVariables::LedIndicatorMode::singleCadence;
-  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].numberOfPulses = duration / (onDuration + offDuration);
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].numberOfPulses = 3;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].onDuration = onDuration;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].offDuration = offDuration;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].endDuration = endDuration;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadenceLength = 1;
+  LedIndicatorStartCadence(applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2]);
+}
+
+void LedIndicatorPanic() {
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].mode = ApplicationVariables::LedIndicatorMode::recurringCadence;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].numberOfPulses = 7;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].onDuration = 50;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].offDuration = 50;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].endDuration = 250;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[1].numberOfPulses = 6;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[1].onDuration = 15;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[1].offDuration = 30;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[1].endDuration = 250;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadenceLength = 2;
   LedIndicatorStartCadence(applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2]);
 }
 
