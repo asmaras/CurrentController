@@ -2,7 +2,7 @@
 #include <SPI.h>
 #include <EEPROM.h>
 
-// Pure integral controller with dead band for stablility
+// Pure integral controller with dead band for stability
 // Integral regulation is accomplished by using the deviation between
 // setpoint and actual value to control the frequency at which the
 // output changes
@@ -16,9 +16,9 @@ namespace Constants {
       // Initial regulation parameters
       // These can be overriden by values configured in the settings menu
       constexpr int powerOnDelay = 15;
-      constexpr int minimumCurrentInmA = 4000;
-      constexpr int currentDeadBandInmA = 500;
-      constexpr int currentHardLimitInmA = 8000;
+      constexpr int minimumCurrentInmA = 14000;
+      constexpr int currentDeadBandInmA = 1000;
+      constexpr int currentHardLimitInmA = 16000;
       constexpr int currentIntegralRegulationGain = 7; // In Hz/A
     }
     namespace Runtime {
@@ -26,6 +26,7 @@ namespace Constants {
       constexpr int currentIntegralRegulationFrequencyMax = 30;
       constexpr int currentIntegralRegulationFrequencyMin = 1;
       constexpr int safeModeTime = 3;
+      constexpr int debugModeMinimumCurrentInmA = 4000;
     }
   }
   namespace HardwareProperties {
@@ -120,7 +121,7 @@ struct ApplicationVariables {
   int powerOnDelay;
   bool powerOnDelayCompleted;
   bool debugMode;
-  bool regulationEnabled;
+  bool regulationActionsAllowed;
   int currentSensorReadingCounter;
   uint32_t currentSensorReadingOversampledValueAccumulator;
   uint16_t currentSensorReadingLatestOversampledValue;
@@ -176,7 +177,7 @@ void setup() {
     EEPROM.get(Constants::EEPROMParameters::Indices::diagnostics, applicationVariables.diagnostics);
   }
   else {
-    // Initialise EEPROM so it can be used to store settings and diagnostics
+    // Initialize EEPROM so it can be used to store settings and diagnostics
     EEPROM.write(Constants::EEPROMParameters::Indices::version, 1);
     SetInitialSettings();
     StoreSettings();
@@ -234,7 +235,7 @@ void loop() {
 }
 
 void HandlePowerOnDelayCompleted() {
-    applicationVariables.powerOnDelayCompleted = true;
+  applicationVariables.powerOnDelayCompleted = true;
   // Enable regulation
   // This pin is externaly pulled up so at power-up regulation is always disabled
   // From software we can set this pin low to enable regulation
@@ -381,6 +382,7 @@ void MeasureAndRegulate() {
   static bool startFirstCurrentMeasureInterval = true;
   static unsigned long currentMeasureIntervalStartTime = 0;
   int currentInmA = 0;
+  int minimumCurrentInmAToUse = applicationVariables.debugMode ? Constants::RegulationParameters::Runtime::debugModeMinimumCurrentInmA : applicationVariables.minimumCurrentInmA;
   bool changeCurrentImmediately = false;
   static int changeFrequency = 0;
   // Perform sensor measurements at a fixed frequency
@@ -390,7 +392,7 @@ void MeasureAndRegulate() {
         // In safe mode
         // Go back to regulation mode when the current stays under the minimum for some time
         if (
-          currentInmA < applicationVariables.minimumCurrentInmA &&
+          currentInmA < minimumCurrentInmAToUse &&
           (applicationVariables.currentTime - applicationVariables.safeModeStartTime >= Constants::RegulationParameters::Runtime::safeModeTime * 1000000)
           ) {
           applicationVariables.safeMode = false;
@@ -398,7 +400,7 @@ void MeasureAndRegulate() {
         }
       }
       else {
-        if (applicationVariables.regulationEnabled) {
+        if (applicationVariables.regulationActionsAllowed) {
           // In normal regulation mode
           if (currentInmA > applicationVariables.currentHardLimitInmA) {
             // Current dangerously high, go to safe mode
@@ -408,21 +410,21 @@ void MeasureAndRegulate() {
             StoreDiagnosticsTimed();
           }
           else {
-            if (currentInmA < applicationVariables.minimumCurrentInmA) {
+            if (currentInmA < minimumCurrentInmAToUse) {
               // Current too low, regulate up
               if (applicationVariables.integralRegulationAction != ApplicationVariables::IntegralRegulationAction::up) {
                 changeCurrentImmediately = true;
               }
               applicationVariables.integralRegulationAction = ApplicationVariables::IntegralRegulationAction::up;
-              changeFrequency = CalculateCurrentChangeFrequency(currentInmA, applicationVariables.minimumCurrentInmA);
+              changeFrequency = CalculateCurrentChangeFrequency(currentInmA, minimumCurrentInmAToUse);
             }
-            else if (currentInmA > applicationVariables.minimumCurrentInmA + applicationVariables.currentDeadBandInmA) {
+            else if (currentInmA > minimumCurrentInmAToUse + applicationVariables.currentDeadBandInmA) {
               // Current is too high, regulate down
               if (applicationVariables.integralRegulationAction != ApplicationVariables::IntegralRegulationAction::down) {
                 changeCurrentImmediately = true;
               }
               applicationVariables.integralRegulationAction = ApplicationVariables::IntegralRegulationAction::down;
-              changeFrequency = CalculateCurrentChangeFrequency(currentInmA, applicationVariables.minimumCurrentInmA + applicationVariables.currentDeadBandInmA);
+              changeFrequency = CalculateCurrentChangeFrequency(currentInmA, minimumCurrentInmAToUse + applicationVariables.currentDeadBandInmA);
             }
             else {
               // Current is within dead band, do nothing
@@ -437,7 +439,7 @@ void MeasureAndRegulate() {
   }
 
   // Integral regulation actions are done at their own frequency, independent from sensor measurements
-  if (applicationVariables.regulationEnabled && applicationVariables.integralRegulationAction != ApplicationVariables::IntegralRegulationAction::none) {
+  if (applicationVariables.regulationActionsAllowed && applicationVariables.integralRegulationAction != ApplicationVariables::IntegralRegulationAction::none) {
     static unsigned long regulateIntervalStartTime = 0;
     if (RunAtFrequency(changeCurrentImmediately, regulateIntervalStartTime, changeFrequency)) {
       switch (applicationVariables.integralRegulationAction) {
@@ -454,15 +456,23 @@ void MeasureAndRegulate() {
   }
 }
 
+void AllowRegulationActions() {
+  applicationVariables.regulationActionsAllowed = true;
+}
+
+void DisallowRegulationActions() {
+  applicationVariables.regulationActionsAllowed = false;
+  applicationVariables.integralRegulationAction = ApplicationVariables::IntegralRegulationAction::none;
+}
+
 void EnableRegulation() {
   digitalWrite(Constants::Pins::enableCurrentRegulationNot, 0);
-  applicationVariables.regulationEnabled = true;
+  AllowRegulationActions();
 }
 
 void DisableRegulation() {
   digitalWrite(Constants::Pins::enableCurrentRegulationNot, 1);
-  applicationVariables.regulationEnabled = false;
-  applicationVariables.integralRegulationAction = ApplicationVariables::IntegralRegulationAction::none;
+  DisallowRegulationActions();
 }
 
 void SetLowestCurrent() {
@@ -557,12 +567,6 @@ void HandleButtonInput() {
         }
       }
     }
-  }
-
-  // Long press during power-on delay switches debug mode on
-  if (!applicationVariables.powerOnDelayCompleted && buttonEvent == ButtonEvent::longPress) {
-    applicationVariables.debugMode = true;
-    HandlePowerOnDelayCompleted();
   }
 
   // Define lambda function for handling up/down parameters
@@ -685,12 +689,15 @@ void HandleButtonInput() {
   auto NextMainMenuModeWithBurst = [NextMenuModeAllParameters](MenuMode nextMenuMode, int burstDuration) {
     NextMenuModeAllParameters(nextMenuMode, true, burstDuration, true, menuModeToMenuNumber[(int)nextMenuMode]);
     };
+
   static int integerSettingParameter = 0;
   static bool booleanSettingParameter = false;
   switch (menuMode) {
   case MenuMode::off:
     if (buttonEvent == ButtonEvent::longPress) {
-      NextMainMenuModeWithBurst(MenuMode::minimumCurrent, 1000);
+      if (!applicationVariables.powerOnDelayCompleted || applicationVariables.debugMode) {
+        NextMainMenuModeWithBurst(MenuMode::minimumCurrent, 1000);
+      }
     }
     break;
   case MenuMode::minimumCurrent:
@@ -702,7 +709,7 @@ void HandleButtonInput() {
     }
     break;
   case MenuMode::minimumCurrentSetting:
-    if (HandleUpDownParameter(applicationVariables.minimumCurrentInmA, 100, 100) == HandleUpDownParameterResult::done) {
+    if (HandleUpDownParameter(applicationVariables.minimumCurrentInmA, 1000, 100) == HandleUpDownParameterResult::done) {
       StoreSettings();
       NextMainMenuModeWithBurst(MenuMode::minimumCurrent, 3000);
     }
@@ -730,7 +737,7 @@ void HandleButtonInput() {
     }
     break;
   case MenuMode::hardLimitCurrentSetting:
-    if (HandleUpDownParameter(applicationVariables.currentHardLimitInmA, 100, 100) == HandleUpDownParameterResult::done) {
+    if (HandleUpDownParameter(applicationVariables.currentHardLimitInmA, 1000, 100) == HandleUpDownParameterResult::done) {
       StoreSettings();
       NextMainMenuModeWithBurst(MenuMode::hardLimitCurrent, 3000);
     }
@@ -754,9 +761,8 @@ void HandleButtonInput() {
       NextMainMenuMode(MenuMode::integralRegulationGain);
     }
     else if (buttonEvent == ButtonEvent::longPress) {
-      applicationVariables.regulationEnabled = false;
-      applicationVariables.aggregatePotentiometerValue = 0;
-      SetPotentiometers();
+      DisallowRegulationActions();
+      SetLowestCurrent();
       NextMenuModeWithBurst(MenuMode::twoPointCalibrationPoint1SetValue, 250);
     }
     break;
@@ -817,7 +823,7 @@ void HandleButtonInput() {
     case HandleUpDownParameterResult::done:
       applicationVariables.currentSensorCalibrationValues.slopeAdcDelta = applicationVariables.currentSensorReadingLatestOversampledValue - applicationVariables.currentSensorCalibrationValues.adcReferencePoint;
       StoreSettings();
-      applicationVariables.regulationEnabled = true;
+      AllowRegulationActions();
       NextMainMenuModeWithBurst(MenuMode::twoPointCalibration, 3000);
       break;
     case HandleUpDownParameterResult::working:
@@ -947,6 +953,12 @@ void HandleButtonInput() {
       LedIndicatorBurst(5000, 1000);
     }
     break;
+  }
+
+  // Long press during power-on delay switches debug mode on
+  if (!applicationVariables.powerOnDelayCompleted && buttonEvent == ButtonEvent::longPress) {
+    applicationVariables.debugMode = true;
+    HandlePowerOnDelayCompleted();
   }
 }
 
@@ -1158,7 +1170,7 @@ void LedIndicatorBurst(int duration, int endDuration) {
   constexpr int onDuration = 15;
   constexpr int offDuration = 30;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].mode = ApplicationVariables::LedIndicatorMode::singleCadence;
-  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].numberOfPulses = 3;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].numberOfPulses = duration / (onDuration + offDuration);
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].onDuration = onDuration;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].offDuration = offDuration;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].endDuration = endDuration;
@@ -1169,10 +1181,10 @@ void LedIndicatorBurst(int duration, int endDuration) {
 void LedIndicatorPanic() {
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].mode = ApplicationVariables::LedIndicatorMode::recurringCadence;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].numberOfPulses = 7;
-  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].onDuration = 50;
-  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].offDuration = 50;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].onDuration = 75;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].offDuration = 75;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[0].endDuration = 250;
-  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[1].numberOfPulses = 6;
+  applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[1].numberOfPulses = 9;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[1].onDuration = 15;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[1].offDuration = 30;
   applicationVariables.ledIndicatorInfo[ApplicationVariables::LedIndicatorLedNumber::led2].cadence[1].endDuration = 250;
